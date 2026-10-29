@@ -26,6 +26,7 @@ from gepa.strategies.batch_sampler import BatchSamplerError, ReflectiveDatasetBu
 
 _TASK_CURATOR_VIEW_KEY = "_task_curator_view"
 _TASK_CURATOR_EVIDENCE_KEY = "task_curator_specific_info"
+_LEGACY_PRESENTATION_FIELDS = ("Task", "Score", "JudgeFeedback", "Error", "EvalFailures", "ReferenceEvaluation")
 _EVIDENCE_EVENTS = frozenset({"evaluation_result", "mutation_comparison"})
 _CURATOR_DECISION_EVENTS = frozenset({"curator_decision", "curator_anchor_decision"})
 _TASK_STATUSES = frozenset(
@@ -98,6 +99,21 @@ def _task_view(task: Any) -> Any:
     return _json_safe(task)
 
 
+def _uses_legacy_evidence_schema(trajectory: Any) -> bool:
+    """Recognize a complete legacy record or its explicit evaluation packet.
+
+    A common field such as Score or Error alone is not a schema declaration.
+    Partial records need the namespaced packet; otherwise preserve all evidence.
+    """
+    return isinstance(trajectory, dict) and (
+        all(field in trajectory for field in _LEGACY_PRESENTATION_FIELDS)
+        or (
+            isinstance(trajectory.get("evaluation_evidence_specific_info"), dict)
+            and any(field in trajectory for field in _LEGACY_PRESENTATION_FIELDS)
+        )
+    )
+
+
 def _evaluator_feedback(trajectory: Any) -> Any:
     if not isinstance(trajectory, dict):
         return _json_safe(trajectory)
@@ -107,11 +123,10 @@ def _evaluator_feedback(trajectory: Any) -> Any:
         return _json_safe(curator_evidence)
 
     # Optional legacy evidence schema; no benchmark implementation is needed.
-    presentation_fields = ("Task", "Score", "JudgeFeedback", "Error", "EvalFailures", "ReferenceEvaluation")
-    if not any(field in trajectory for field in presentation_fields):
+    if not _uses_legacy_evidence_schema(trajectory):
         return _json_safe(trajectory)
 
-    summary = {field: _json_safe(trajectory.get(field)) for field in presentation_fields}
+    summary = {field: _json_safe(trajectory.get(field)) for field in _LEGACY_PRESENTATION_FIELDS}
     packet = trajectory.get("evaluation_evidence_specific_info")
     if isinstance(packet, dict):
         summary["Evaluation"] = {
@@ -137,8 +152,7 @@ def _historical_success_state(trajectory: Any) -> Any:
         return summary
     # Only project the legacy presentation format. Other adapters can supply
     # arbitrary evidence without having it replaced by empty legacy fields.
-    presentation_fields = ("Task", "Score", "JudgeFeedback", "Error", "EvalFailures", "ReferenceEvaluation")
-    if not isinstance(trajectory, dict) or not any(field in trajectory for field in presentation_fields):
+    if not _uses_legacy_evidence_schema(trajectory):
         return summary
 
     evaluation = summary.get("Evaluation")
@@ -223,6 +237,16 @@ class _BranchState:
         )
 
 
+@dataclass
+class _ProposalContext:
+    iteration: int
+    proposal_id: str
+    parent_idx: int
+    entry: dict[str, Any]
+    anchors: dict[Any, str] = field(default_factory=dict)
+    evaluation_id: str | None = None
+
+
 @dataclass(frozen=True)
 class _CuratorDecision:
     should_run: bool
@@ -260,9 +284,11 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
 
     Default extraction honors ``_task_curator_view`` on tasks and
     ``task_curator_specific_info`` on trajectories. Without a dedicated packet,
-    legacy Task/Score/JudgeFeedback records use selected evaluation fields for
-    history and a smaller success reference; other formats pass through. Raw
-    rollout artifacts outside an explicit packet are not included in that view.
+    complete legacy evaluator records (or partial records with an explicit
+    evaluation packet) use selected fields for history and a smaller success
+    reference. Other formats pass through intact, even when they contain common
+    keys such as Task, Score or Error. Raw rollout artifacts outside an explicit
+    packet are not included in that view.
     These legacy field names are optional compatibility conventions; arbitrary
     task/trajectory formats work without benchmark packages or services.
 
@@ -290,16 +316,18 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
     prefixes with their parent and then advance independently. Returning to an
     older candidate restores its own curriculum, never a descendant's outcomes.
     A rejected proposal remains diagnostic evidence in its parent's history.
+    A new seed supplied on resume forks the saved seed's curriculum without
+    treating its validation results as task-history or success-anchor evidence.
     ``history`` exposes a detached audit view of the active candidate.
 
-    This sampler supports greedy and sequential Pareto search, with single-parent
-    mutations and a stable task-ID universe. Multi-proposal sampling and
-    multi-parent merge are rejected explicitly. Resume uses saved curator trace
+    This sampler supports greedy, sequential Pareto, and batched single-parent
+    proposals (Best-of-N and PxN), with a stable task-ID universe. Sampling is
+    ordered; sibling mutations inherit a frozen common parent prefix. Multi-parent
+    merge is rejected explicitly. Resume uses saved curator trace
     entries automatically. Create a new sampler per optimization run. Full-curator and heuristic anchor modes
     are intentionally not part of this implementation.
     """
 
-    requires_sequential_sampling = True
     requires_single_parent = True
 
     def __init__(
@@ -351,9 +379,11 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         self.raise_on_error = raise_on_error
         self._branches: dict[int, _BranchState] = {0: _BranchState()}
         self._active_candidate_idx = 0
-        self._iteration_parents: dict[int, int] = {}
+        self._contexts: dict[str, _ProposalContext] = {}
+        self._active_proposal_id: str | None = None
+        self._parent_bases: dict[int, _BranchState] = {}
+        self._batch_entry: dict[str, Any] | None = None
         self._known_ids: tuple[DataId, ...] | None = None
-        self._expected_batches: dict[int, tuple[DataId, ...]] = {}
         self._recorded_iterations: set[int] = set()
         self._restored = False
 
@@ -378,11 +408,145 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
     def _append_history(self, task_id: DataId, row: dict[str, Any]) -> None:
         self._branch.history_heads[task_id] = _HistoryNode(self._branch.history_heads[task_id], deepcopy(row))
 
+    @property
+    def _context(self) -> _ProposalContext:
+        if self._active_proposal_id not in self._contexts:
+            raise TaskCuratorContractError("No active curator proposal")
+        return self._contexts[self._active_proposal_id]
+
+    def _activate_proposal(self, iteration: int, proposal_id: str | None) -> None:
+        if proposal_id is None and len(self._contexts) == 1:
+            proposal_id = next(iter(self._contexts))
+        context = self._contexts.get(proposal_id) if isinstance(proposal_id, str) else None
+        if context is None or context.iteration != iteration:
+            raise TaskCuratorContractError("Missing or unknown curator proposal ID")
+        self._active_proposal_id = proposal_id
+        self._active_candidate_idx = context.parent_idx
+
+    def _begin_proposal(self, state: GEPAState, parent: int, proposal_id: str | None) -> None:
+        iteration = state.i + 1
+        proposal_id = proposal_id if proposal_id is not None else f"{iteration}-0"
+        if not isinstance(proposal_id, str) or not proposal_id:
+            raise TaskCuratorContractError("A proposal ID must be a nonempty string")
+        top = self._iteration_entry(state, iteration)
+        self._batch_entry = top
+        if self._contexts and next(iter(self._contexts.values())).iteration != iteration:
+            self._contexts.clear()
+            self._parent_bases.clear()
+        if proposal_id in self._contexts or any("task_curator_results" in c.entry for c in self._contexts.values()):
+            raise TaskCuratorContractError("Duplicate proposal ID or sampling after evaluation began")
+        if not self._contexts:
+            if top.get("task_curator_enabled"):
+                raise TaskCuratorContractError("Iteration already contains curator evidence")
+            entry = top
+        else:
+            if len(self._contexts) == 1:
+                # Preserve the version-8 trace for N=1. Promote only when a
+                # second slot exists, before evaluations or outcomes begin.
+                first = next(iter(self._contexts.values()))
+                first.entry = {"i": state.i, "proposal_id": first.proposal_id}
+                for key in list(top):
+                    if key.startswith("task_curator_"):
+                        first.entry[key] = top.pop(key)
+                first.entry["task_curator_sampled_anchors"] = [
+                    {"task_id": tid, "success_state_id": sid} for tid, sid in first.anchors.items()
+                ]
+                top.update(
+                    task_curator_enabled=True,
+                    task_curator_settings={**self._settings(), "version": 9},
+                    task_curator_proposals=[first.entry],
+                    task_curator_outcome_order=[],
+                    task_curator_batch_complete=False,
+                )
+            entry = {"i": state.i, "proposal_id": proposal_id}
+            top["task_curator_proposals"].append(entry)
+        self._contexts[proposal_id] = _ProposalContext(iteration, proposal_id, parent, entry)
+        self._activate_proposal(iteration, proposal_id)
+
+    def _freeze_parents(self) -> None:
+        if len(self._contexts) <= 1 or self._parent_bases:
+            return
+        if any("task_curator_results" not in c.entry for c in self._contexts.values()):
+            raise TaskCuratorContractError("All parent evaluations must precede mutation outcomes")
+        self._parent_bases = {c.parent_idx: self._branches[c.parent_idx].fork() for c in self._contexts.values()}
+
+    def _evidence_metadata(self, *, comparison: bool = False) -> dict[str, Any]:
+        if len(self._contexts) <= 1:
+            return {}
+        c = self._context
+        result = {"evaluation_id": c.evaluation_id}
+        if comparison:
+            result["proposal_id"] = c.proposal_id
+        return result
+
+    def finish_iteration(
+        self,
+        *,
+        iteration: int,
+        proposals: Sequence[CandidateProposal] | None,
+        state: GEPAState,
+        aborted_before_registration: bool = False,
+    ) -> None:
+        """Fail closed before saving an incomplete batch; ordinary skips keep parent evidence."""
+        if not self._contexts or next(iter(self._contexts.values())).iteration != iteration:
+            return
+        can_recover = (
+            aborted_before_registration
+            and len(self._contexts) == 1
+            and self._context.entry.get("task_curator_child_idx") is None
+        )
+        if proposals is None:
+            if can_recover and "task_curator_results" in self._context.entry:
+                # The sequential path retains parent evidence after a recoverable
+                # failure, but only before any child has entered the pool.
+                return
+            raise TaskCuratorContractError(
+                "Proposal generation failed; incomplete curator batch cannot be checkpointed"
+            )
+        returned = set()
+        for proposal in proposals:
+            pid = proposal.metadata.get("proposal_id")
+            if pid is None and len(self._contexts) == 1:
+                pid = next(iter(self._contexts))
+            if pid not in self._contexts or pid in returned:
+                raise TaskCuratorContractError("Returned proposals have unknown or duplicate IDs")
+            returned.add(pid)
+        for pid, context in self._contexts.items():
+            entry = context.entry
+            if "task_curator_results" not in entry:
+                raise TaskCuratorContractError("Proposal is missing its parent evaluation")
+            if ("task_curator_mutation_results" in entry) != (pid in returned):
+                if can_recover and pid in returned:
+                    # Selection may fail after the proposal was evaluated. Keep
+                    # the parent history without inventing a rejection or child.
+                    continue
+                raise TaskCuratorContractError(
+                    "Returned proposal is missing its final outcome, or an unreturned one has it"
+                )
+        if len(self._contexts) > 1:
+            top = self._iteration_entry(state, iteration)
+            children = [
+                c.entry["task_curator_child_idx"]
+                for c in self._contexts.values()
+                if c.entry.get("task_curator_child_idx") is not None
+            ]
+            if sorted(children) != sorted(top.get("new_program_indices", [])):
+                raise TaskCuratorContractError("Registered candidates and curator outcomes differ")
+            for pid, context in self._contexts.items():
+                context.entry["task_curator_outcome"] = (
+                    "skipped"
+                    if pid not in returned
+                    else "accepted"
+                    if context.entry["task_curator_child_idx"] is not None
+                    else "rejected"
+                )
+            top["task_curator_batch_complete"] = True
+
     def _check_iteration_parent(self, iteration: int) -> int:
-        parent = self._iteration_parents.get(iteration)
-        if parent is None or parent != self._active_candidate_idx:
+        context = self._context
+        if context.iteration != iteration or context.parent_idx != self._active_candidate_idx:
             raise TaskCuratorContractError("Curator evidence does not belong to the active sampled parent")
-        return parent
+        return context.parent_idx
 
     def _fork_candidate(self, candidate_idx: int) -> None:
         if isinstance(candidate_idx, bool) or not isinstance(candidate_idx, int) or candidate_idx < 1:
@@ -391,6 +555,58 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             raise TaskCuratorContractError("Curator candidate already exists")
         self._branches[candidate_idx] = self._branch.fork()
         self._active_candidate_idx = candidate_idx
+
+    def _restore_if_needed(self, loader: DataLoader[DataId, DataInst], state: GEPAState) -> None:
+        if not self._restored:
+            prior = [row for row in state.full_program_trace if row.get("i", -1) < state.i]
+            self.load_from_trace(prior, loader, require_history=bool(prior))
+
+    def _record_candidate_registration(
+        self,
+        *,
+        iteration: int,
+        parent_idx: int,
+        candidate_idx: int,
+        loader: DataLoader[DataId, DataInst],
+        state: GEPAState,
+    ) -> None:
+        """Inherit a registered candidate's parent without inventing training evidence."""
+        if iteration != state.i + 1:
+            raise TaskCuratorContractError("Candidate registration belongs to a different iteration")
+        self._restore_if_needed(loader, state)
+        self.assert_no_unrecorded_through(state.i)
+        self._set_or_validate_universe(loader)
+        entry = self._iteration_entry(state, iteration)
+        if (
+            iteration in self._recorded_iterations
+            or entry.get("task_curator_enabled")
+            or entry.get("new_program_idx") != candidate_idx
+            or entry.get("proposal_accepted", True) is not True
+        ):
+            raise TaskCuratorContractError("Candidate requires its own accepted registration")
+        if isinstance(parent_idx, bool) or not isinstance(parent_idx, int) or parent_idx not in self._branches:
+            raise TaskCuratorContractError("Candidate registration references unknown curator parent")
+        previous = self._active_candidate_idx
+        self._active_candidate_idx = parent_idx
+        try:
+            self._fork_candidate(candidate_idx)
+        except TaskCuratorContractError:
+            self._active_candidate_idx = previous
+            raise
+        entry.update(
+            {
+                # Keep the version-8 wire format so existing checkpoints replay
+                # unchanged. Registration now arrives from the common pool-add
+                # path, before the engine's outer acceptance notification.
+                "proposal_accepted": True,
+                "task_curator_enabled": True,
+                "task_curator_settings": self._settings(),
+                "task_curator_resumed_seed": True,
+                "task_curator_parent_idx": parent_idx,
+                "task_curator_child_idx": candidate_idx,
+            }
+        )
+        self._recorded_iterations.add(iteration)
 
     def _log(self, message: str) -> None:
         if self.logger is not None:
@@ -406,8 +622,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             "uses_default_success": self.is_success is _is_clean_success,
         }
 
+    def _trace_entry(self, state: GEPAState, iteration: int) -> dict:
+        if self._active_proposal_id in self._contexts and self._context.iteration == iteration:
+            return self._context.entry
+        return self._iteration_entry(state, iteration)
+
     @staticmethod
-    def _trace_entry(state: GEPAState, iteration: int) -> dict:
+    def _iteration_entry(state: GEPAState, iteration: int) -> dict:
         trace_index = iteration - 1
         matches = [entry for entry in state.full_program_trace if entry.get("i") == trace_index]
         if len(matches) != 1:
@@ -474,14 +695,29 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             should_run, skip_epochs=duration, skip_type=category, task_status=_parse_task_status(payload)
         )
 
+    @staticmethod
+    def _execution_key(row: dict[str, Any]) -> tuple:
+        if "proposal_id" in row:
+            return (row.get("iteration"), "proposal", row["proposal_id"])
+        if "evaluation_id" in row:
+            return (row.get("iteration"), "evaluation", row["evaluation_id"])
+        return (row.get("epoch"), row.get("iteration"))
+
     def _execution_units(self, task_id: DataId) -> list[dict[str, Any]]:
-        """Deduplicate evaluations covered by a before/after comparison."""
-        units: dict[tuple[Any, Any], dict[str, Any]] = {}
-        for index, row in enumerate(self._task_history(task_id)):
+        """A comparison is one unit; reused parent evaluations are not extra attempts."""
+        history = self._task_history(task_id)
+        compared = {
+            (r["iteration"], r["evaluation_id"])
+            for r in history
+            if r.get("event") == "mutation_comparison" and "evaluation_id" in r
+        }
+        units: dict[tuple, dict[str, Any]] = {}
+        for index, row in enumerate(history):
             if row.get("event") not in _EVIDENCE_EVENTS:
                 continue
-            iteration = row.get("iteration")
-            key = (row.get("epoch"), iteration if iteration is not None else ("row", index))
+            if row.get("event") == "evaluation_result" and (row.get("iteration"), row.get("evaluation_id")) in compared:
+                continue
+            key = self._execution_key(row) if row.get("iteration") is not None else ("row", index)
             previous = units.get(key)
             if previous is None or row.get("event") == "mutation_comparison":
                 units[key] = row
@@ -527,7 +763,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         last_execution = None
         for row in self._task_history(task_id):
             if row.get("event") in _EVIDENCE_EVENTS:
-                last_execution = (row.get("epoch"), row.get("iteration"))
+                last_execution = self._execution_key(row)
             elif row.get("event") in _CURATOR_DECISION_EVENTS and row.get("task_status") is not None:
                 if last_execution is not None:
                     assessments[last_execution] = {
@@ -543,7 +779,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         assessments = self._execution_assessments(task_id)
         for row in self._execution_units(task_id)[: -self.history_window]:
             summary = {"epoch_id": row.get("epoch"), "task_status": None}
-            summary.update(assessments.get((row.get("epoch"), row.get("iteration")), {}))
+            summary.update(assessments.get(self._execution_key(row), {}))
             if row.get("event") == "mutation_comparison":
                 summary.update(
                     before=self._compact_outcome(row.get("before", {})),
@@ -576,7 +812,15 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         def clean_record(row: dict[str, Any]) -> dict[str, Any]:
             result = {}
             for key, item in row.items():
-                if key in {"iteration", "iteration_id", "task_id", "reason", "anchor_reason"}:
+                if key in {
+                    "iteration",
+                    "iteration_id",
+                    "task_id",
+                    "reason",
+                    "anchor_reason",
+                    "proposal_id",
+                    "evaluation_id",
+                }:
                     continue
                 if key == "success_state_id":
                     if item in aliases:
@@ -769,19 +1013,15 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         state: GEPAState,
         *,
         candidate_idx: int,
+        proposal_id: str | None = None,
     ) -> list[DataId]:
-        if not self._restored:
-            prior = [row for row in state.full_program_trace if row.get("i", -1) < state.i]
-            self.load_from_trace(prior, loader, require_history=bool(prior))
+        self._restore_if_needed(loader, state)
         self.assert_no_unrecorded_through(state.i)
         all_ids = self._set_or_validate_universe(loader)
         iteration = state.i + 1
-        if iteration in self._expected_batches or iteration in self._recorded_iterations:
-            raise TaskCuratorContractError(f"Task curator iteration {iteration} was sampled more than once.")
         if isinstance(candidate_idx, bool) or not isinstance(candidate_idx, int) or candidate_idx not in self._branches:
             raise TaskCuratorContractError(f"No curator history for candidate {candidate_idx!r}")
-        self._active_candidate_idx = candidate_idx
-        self._iteration_parents[iteration] = candidate_idx
+        self._begin_proposal(state, candidate_idx, proposal_id)
         selected: list[DataId] = []
         selected_set: set[DataId] = set()
         decisions: list[dict[str, Any]] = []
@@ -854,7 +1094,9 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                         selected_set.add(task_id)
                         self._branch.selected_in_epoch += 1
 
-        self._expected_batches[iteration] = tuple(selected)
+        self._context.anchors = {
+            tid: self._branch.retained_success[tid] for tid in selected if tid in self._branch.retained_success
+        }
         trace_entry = self._trace_entry(state, iteration)
         trace_entry.update(
             {
@@ -872,6 +1114,10 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 "task_curator_sampled_ids": list(selected),
             }
         )
+        if len(self._contexts) > 1:
+            trace_entry["task_curator_sampled_anchors"] = [
+                {"task_id": tid, "success_state_id": sid} for tid, sid in self._context.anchors.items()
+            ]
         return selected
 
     def _record_success_state(
@@ -888,10 +1134,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         if trajectory is None or not self.use_reflection_anchors or not self.is_success(score, trajectory):
             return None
         success_state_id = _success_state_id(task_id, iteration, source)
+        if len(self._contexts) > 1:
+            identity = self._context.evaluation_id if source == "before" else self._context.proposal_id
+            success_state_id += "/" + str(identity)
         snapshot = {
             "success_state_id": success_state_id,
             "task_id": task_id,
-            "epoch": self._branch.epoch,
+            "epoch": self._context.entry["task_curator_epoch"] if len(self._contexts) > 1 else self._branch.epoch,
             "iteration": iteration,
             "source": source,
             "candidate_idx": self._active_candidate_idx if source == "before" or mutation_accepted else None,
@@ -920,10 +1169,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         state: GEPAState,
     ) -> None:
         parent_idx = self._check_iteration_parent(iteration)
-        if iteration in self._recorded_iterations:
-            raise TaskCuratorContractError(f"Task curator iteration {iteration} was recorded more than once.")
-        expected = self._expected_batches.get(iteration)
-        if expected is None or tuple(task_ids) != expected:
+        entry = self._trace_entry(state, iteration)
+        if "task_curator_results" in entry:
+            raise TaskCuratorContractError(
+                f"Task curator proposal was recorded more than once at iteration {iteration}."
+            )
+        expected = entry.get("task_curator_sampled_ids")
+        if expected is None or list(task_ids) != expected:
             raise TaskCuratorContractError(
                 f"Task curator task association mismatch at iteration {iteration}: "
                 f"expected {list(expected or ())!r}, received {list(task_ids)!r}."
@@ -931,14 +1183,40 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         if not (len(task_ids) == len(scores) == len(outputs) == len(trajectories)):
             raise TaskCuratorContractError(f"Task curator first-pass fields are misaligned at iteration {iteration}.")
 
+        context = self._context
+        if self._parent_bases:
+            raise TaskCuratorContractError("Cannot append parent evidence after outcomes began")
+        if len(self._contexts) > 1:
+            if context.evaluation_id is None:
+                context.evaluation_id = context.proposal_id
+            entry["task_curator_evaluation_id"] = context.evaluation_id
+            for previous in self._contexts.values():
+                if (
+                    previous is not context
+                    and previous.parent_idx == parent_idx
+                    and previous.evaluation_id == context.evaluation_id
+                    and "task_curator_results" in previous.entry
+                ):
+                    rows = previous.entry["task_curator_results"]
+                    if (
+                        [r["task_id"] for r in rows] != list(task_ids)
+                        or [r["score"] for r in rows] != list(scores)
+                        or [r["evaluator_feedback"] for r in rows]
+                        != [_json_safe(self.evidence_extractor(t)) for t in trajectories]
+                    ):
+                        raise TaskCuratorContractError("Reused evaluation ID has different evidence")
+                    entry["task_curator_evaluation_ref"] = previous.proposal_id
+                    entry["task_curator_results"] = rows
+                    return
         results = []
         for task_id, score, _output, trajectory in zip(task_ids, scores, outputs, trajectories, strict=True):
             if not isinstance(score, Real) or not math.isfinite(float(score)):
                 raise TaskCuratorContractError(f"Task curator received invalid score for task {task_id!r}: {score!r}.")
             row = {
                 "event": "evaluation_result",
+                **self._evidence_metadata(),
                 "candidate_idx": parent_idx,
-                "epoch": self._branch.epoch,
+                "epoch": entry["task_curator_epoch"] if len(self._contexts) > 1 else self._branch.epoch,
                 "iteration": iteration,
                 "score": float(score),
                 "evaluator_feedback": _json_safe(self.evidence_extractor(trajectory)),
@@ -957,7 +1235,6 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             results.append({"task_id": task_id, **row})
 
         self._recorded_iterations.add(iteration)
-        del self._expected_batches[iteration]
         self._trace_entry(state, iteration)["task_curator_results"] = results
 
     def record_mutation_comparison(
@@ -975,13 +1252,15 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
     ) -> None:
         """Commit all child evidence together; failed extraction must not create a partial branch."""
         parent_idx = self._check_iteration_parent(iteration)
+        self._freeze_parents()
         parent = self._branch
         existing = set(self._branches)
         entry = self._trace_entry(state, iteration)
         previous_entry = dict(entry)
         if "task_curator_success_states" in entry:
             entry["task_curator_success_states"] = list(entry["task_curator_success_states"])
-        self._branches[parent_idx] = parent.fork()
+        base = self._parent_bases.get(parent_idx, parent) if mutation_accepted else parent
+        self._branches[parent_idx] = base.fork()
         try:
             self._record_mutation_comparison(
                 iteration=iteration,
@@ -1006,6 +1285,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             raise TaskCuratorContractError("Failed to record curator mutation evidence") from exc
         if mutation_accepted:
             self._branches[parent_idx] = parent
+        if len(self._contexts) > 1:
+            self._iteration_entry(state, iteration)["task_curator_outcome_order"].append(self._context.proposal_id)
 
     def _record_mutation_comparison(
         self,
@@ -1024,7 +1305,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         trace_entry = self._trace_entry(state, iteration)
         if "task_curator_mutation_results" in trace_entry:
             raise TaskCuratorContractError("Mutation comparison was recorded more than once")
-        if iteration not in self._recorded_iterations:
+        if "task_curator_results" not in trace_entry:
             raise TaskCuratorContractError("Mutation comparison requires a recorded parent evaluation")
         sampled_ids = trace_entry.get("task_curator_sampled_ids")
         if list(task_ids) != sampled_ids:
@@ -1068,7 +1349,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         ):
             row = {
                 "event": "mutation_comparison",
-                "epoch": self._branch.epoch,
+                **self._evidence_metadata(comparison=True),
+                "epoch": trace_entry["task_curator_epoch"] if len(self._contexts) > 1 else self._branch.epoch,
                 "iteration": iteration,
                 "mutation_accepted": bool(mutation_accepted),
                 "batch_score_before": before_sum,
@@ -1084,7 +1366,9 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                     "evaluator_feedback": _json_safe(self.evidence_extractor(after_trajectory)),
                 },
             }
-            before_id = _success_state_id(task_id, iteration, "before")
+            before_id = next(
+                r.get("success_state_id") for r in trace_entry["task_curator_results"] if r["task_id"] == task_id
+            )
             if before_id in self._branch.success_states[task_id]:
                 row["before"]["success_state_id"] = before_id
             after_id = self._record_success_state(
@@ -1104,11 +1388,20 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         trace_entry["task_curator_mutation_results"] = results
 
     def assert_no_unrecorded_through(self, iteration: int) -> None:
-        missing = sorted(candidate for candidate in self._expected_batches if candidate <= iteration)
+        if (
+            len(self._contexts) > 1
+            and next(iter(self._contexts.values())).iteration <= iteration
+            and (self._batch_entry or {}).get("task_curator_batch_complete") is not True
+        ):
+            raise TaskCuratorContractError("Previous curator batch has not been finalized")
+        missing = [
+            c.proposal_id
+            for c in self._contexts.values()
+            if c.iteration <= iteration and "task_curator_results" not in c.entry
+        ]
         if missing:
             raise TaskCuratorContractError(
-                "Task curator sampled minibatches without first-pass results for iteration(s): "
-                + ", ".join(str(candidate) for candidate in missing)
+                "Task curator sampled minibatches without first-pass results: " + ", ".join(missing)
             )
 
     def observe_evaluation(
@@ -1118,8 +1411,12 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         task_ids: Sequence[DataId],
         evaluation: EvaluationBatch,
         state: GEPAState,
+        proposal_id: str | None = None,
+        evaluation_id: str | None = None,
     ) -> None:
         """Record parent evidence even if reflection is skipped or fails."""
+        self._activate_proposal(iteration, proposal_id)
+        self._context.evaluation_id = evaluation_id or self._context.proposal_id
         self.record_first_pass(
             iteration=iteration,
             task_ids=task_ids,
@@ -1129,21 +1426,36 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             state=state,
         )
 
-    def observe_proposal(
+    def observe_outcome(
         self,
         *,
         iteration: int,
-        proposal: CandidateProposal,
-        accepted: bool,
+        parent_ids: Sequence[int],
+        candidate_idx: int | None,
+        proposal: CandidateProposal | None,
+        loader: DataLoader[DataId, DataInst],
         state: GEPAState,
-        candidate_idx: int | None = None,
     ) -> None:
-        """Record paired evidence with the engine's final selection outcome."""
+        """Apply a final outcome, keeping child registration and evidence atomic."""
+        if len(parent_ids) != 1:
+            raise TaskCuratorContractError("Curator outcomes require exactly one parent")
+        if proposal is None:
+            if candidate_idx is None:
+                raise TaskCuratorContractError("An outcome without a proposal must register a child")
+            self._record_candidate_registration(
+                iteration=iteration,
+                parent_idx=parent_ids[0],
+                candidate_idx=candidate_idx,
+                loader=loader,
+                state=state,
+            )
+            return
+        self._activate_proposal(iteration, proposal.metadata.get("proposal_id"))
         before, after = proposal.eval_before, proposal.eval_after
         if before is None or after is None or proposal.subsample_indices is None:
             raise TaskCuratorContractError("Curator needs before/after evaluations and task IDs")
         parent_idx = self._check_iteration_parent(iteration)
-        if proposal.parent_program_ids != [parent_idx]:
+        if list(parent_ids) != [parent_idx] or proposal.parent_program_ids != [parent_idx]:
             raise TaskCuratorContractError("Proposal parents do not match the curator's sampled parent")
         ids = proposal.subsample_indices
         self.record_mutation_comparison(
@@ -1153,7 +1465,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             before_trajectories=before.trajectories or [None] * len(ids),
             after_scores=after.scores,
             after_trajectories=after.trajectories or [None] * len(ids),
-            mutation_accepted=accepted,
+            mutation_accepted=candidate_idx is not None,
             state=state,
             candidate_idx=candidate_idx,
         )
@@ -1167,6 +1479,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         components_to_update: list[str],
         make_reflective_dataset: ReflectiveDatasetBuilder,
         state: GEPAState,
+        proposal_id: str | None = None,
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:
         """Build and enrich each task's records before merging the minibatch.
 
@@ -1183,7 +1496,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         use_reflection_anchors=False to preserve whole-batch assembly. Splitting
         can also change RNG/callback order in stateful builders.
         """
+        self._activate_proposal(state.i + 1, proposal_id)
         self._check_iteration_parent(state.i + 1)
+        if list(task_ids) != self._context.entry.get("task_curator_sampled_ids"):
+            raise TaskCuratorContractError("Reflection task IDs do not align with the sampled proposal")
+        if self._parent_bases:
+            raise TaskCuratorContractError("Reflection must precede mutation outcomes")
+        anchors = self._context.anchors
         if not self.use_reflection_anchors:
             return make_reflective_dataset(candidate, evaluation, components_to_update)
         for name in ("scores", "outputs", "trajectories", "objective_scores"):
@@ -1222,7 +1541,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 self._log(f"Task {tid!r}: no reflection material; skipping reflection, retaining evaluation history.")
                 continue
 
-            sid = self._branch.retained_success.get(tid)
+            sid = anchors.get(tid)
             trajectory = single.trajectories[0] if single.trajectories is not None else None
             anchor = None
             if sid is not None and self.is_failure(single.scores[0], trajectory):
@@ -1255,7 +1574,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             {"task_id": tid, "reason": "no_reflection_material"} for tid in skipped_task_ids
         ]
         entry["task_curator_reflection_anchors"] = [
-            {"task_id": tid, "success_state_id": self._branch.retained_success[tid], "supporting_success_ids": []}
+            {"task_id": tid, "success_state_id": anchors[tid], "supporting_success_ids": []}
             for tid in task_ids
             if tid in injected_task_ids
         ]
@@ -1268,7 +1587,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         *,
         require_history: bool,
     ) -> None:
-        """Replay candidate-scoped events; never reinterpret a legacy global history as branches."""
+        """Replay v8 single proposals and v9 batches at complete iteration boundaries."""
         self._set_or_validate_universe(loader)
         entries = [entry for entry in trace if entry.get("task_curator_enabled")]
         if not entries and require_history:
@@ -1280,103 +1599,221 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             )
         }
         self._active_candidate_idx = 0
-        self._iteration_parents.clear()
+        self._contexts.clear()
+        self._active_proposal_id = None
+        self._parent_bases.clear()
         self._recorded_iterations.clear()
-        self._expected_batches.clear()
         self._restored = False
         for entry in entries:
-            if entry.get("task_curator_settings") != self._settings():
+            batch = "task_curator_proposals" in entry
+            settings = {**self._settings(), "version": 9} if batch else self._settings()
+            if entry.get("task_curator_settings") != settings:
                 raise TaskCuratorContractError("Curator settings changed on resume (including history format)")
             iteration = entry["i"] + 1
             if iteration in self._recorded_iterations:
                 raise TaskCuratorContractError("Duplicate curator iteration in checkpoint")
-            parent = entry.get("task_curator_parent_idx")
-            if isinstance(parent, bool) or not isinstance(parent, int) or parent not in self._branches:
-                raise TaskCuratorContractError("Checkpoint references unknown curator parent")
-            if entry.get("selected_program_candidate", parent) != parent:
-                raise TaskCuratorContractError("Curator parent differs from selected candidate")
-            self._active_candidate_idx = parent
-            self._iteration_parents[iteration] = parent
-            for row in entry["task_curator_decisions"]:
-                tid = row["task_id"]
-                if tid not in self._branch.history_heads:
-                    raise TaskCuratorContractError("Checkpoint references unknown task")
-                update = row.get("success_pool_update")
-                if update:
-                    old = self._branch.retained_success.get(tid)
-                    choices = update["candidates"]
-                    choice = update["selected_success"]
-                    if (
-                        update["previous"] != old
-                        or any(sid not in self._branch.success_states[tid] for sid in choices.values())
-                        or (choice != "retained" and choice not in choices)
-                    ):
-                        raise TaskCuratorContractError("Invalid retained success predecessor or candidates")
-                    expected = old if choice == "retained" else choices[choice]
-                    if update["retained"] != expected:
-                        raise TaskCuratorContractError("Invalid retained success result")
-                    if expected is not None:
-                        self._branch.retained_success[tid] = expected
-                if row["decision"] == "skip":
-                    due = row["epoch"] + row["skip_epochs"]
-                    if row["skip_epochs"] < 1 or row["next_run_epoch"] != due:
-                        raise TaskCuratorContractError("Invalid cooldown in checkpoint")
-                    self._branch.next_run_epoch[tid] = due
-                    self._branch.skip_types[tid] = row["skip_type"]
+            if batch:
+                self._restore_batch(entry)
+            else:
+                parent = self._restore_parent(entry)
+                if "task_curator_resumed_seed" in entry:
+                    self._restore_candidate_registration(entry)
                 else:
-                    self._branch.next_run_epoch.pop(tid, None)
-                    self._branch.skip_types.pop(tid, None)
-                self._append_history(tid, _history_row_without_output(row))
-
-            results = entry.get("task_curator_results")
-            ids = entry["task_curator_sampled_ids"]
-            if not isinstance(results, list) or [r["task_id"] for r in results] != ids:
-                raise TaskCuratorContractError("Checkpoint is missing aligned parent evaluation results")
-            if any(r.get("candidate_idx") != parent for r in results):
-                raise TaskCuratorContractError("Parent evaluation belongs to a different candidate")
-            self._restore_successes(entry, source="before", candidate_idx=parent)
-            for row in results:
-                self._append_history(row["task_id"], _history_row_without_output(row))
-
-            # Restore sampling progress on the parent before taking the child's
-            # snapshot. Returning to this parent resumes its own cursor/clock.
-            self._branch.epoch = entry["task_curator_epoch"]
-            self._branch.epoch_order = list(entry["task_curator_epoch_order"])
-            self._branch.position = entry["task_curator_position_after_sampling"]
-            self._branch.selected_in_epoch = entry["task_curator_selected_in_epoch_after_sampling"]
-            if (
-                len(self._branch.epoch_order) != len(self._known_ids or ())
-                or set(self._branch.epoch_order) != set(self._known_ids or ())
-                or not 0 <= self._branch.position <= len(self._branch.epoch_order)
-            ):
-                raise TaskCuratorContractError("Invalid saved epoch position")
-
-            comparisons = entry.get("task_curator_mutation_results", [])
-            child = entry.get("task_curator_child_idx")
-            if entry.get("new_program_idx") is not None and child is None:
-                raise TaskCuratorContractError("Accepted candidate is missing its curator branch evidence")
-            if comparisons:
-                if [r["task_id"] for r in comparisons] != ids or "task_curator_child_idx" not in entry:
-                    raise TaskCuratorContractError("Checkpoint is missing aligned mutation results")
-                accepted = child is not None
-                if any(
-                    r["mutation_accepted"] is not accepted
-                    or r["before"].get("candidate_idx") != parent
-                    or r["after"].get("candidate_idx") != child
-                    for r in comparisons
-                ):
-                    raise TaskCuratorContractError("Mutation ownership or acceptance differs from checkpoint lineage")
-                if accepted:
-                    if entry.get("new_program_idx", child) != child:
-                        raise TaskCuratorContractError("Curator child differs from accepted candidate")
-                    self._fork_candidate(child)
-                self._restore_successes(entry, source="after", candidate_idx=child)
-                for row in comparisons:
-                    self._append_history(row["task_id"], _history_row_without_output(row))
-            elif child is not None or any(s["source"] == "after" for s in entry.get("task_curator_success_states", [])):
-                raise TaskCuratorContractError("Checkpoint has a child without mutation evidence")
+                    self._restore_decisions(entry)
+                    self._restore_results(entry, parent)
+                    self._restore_cursor(entry)
+                    self._restore_outcome(entry, parent)
             self._recorded_iterations.add(iteration)
         self._restored = True
+
+    def _restore_parent(self, entry: dict) -> int:
+        parent = entry.get("task_curator_parent_idx")
+        if isinstance(parent, bool) or not isinstance(parent, int) or parent not in self._branches:
+            raise TaskCuratorContractError("Checkpoint references unknown curator parent")
+        if entry.get("selected_program_candidate", parent) != parent:
+            raise TaskCuratorContractError("Curator parent differs from selected candidate")
+        self._active_candidate_idx = parent
+        return parent
+
+    def _restore_decisions(self, entry: dict) -> None:
+        for row in entry["task_curator_decisions"]:
+            tid = row["task_id"]
+            if tid not in self._branch.history_heads:
+                raise TaskCuratorContractError("Checkpoint references unknown task")
+            update = row.get("success_pool_update")
+            if update:
+                old = self._branch.retained_success.get(tid)
+                choices = update["candidates"]
+                choice = update["selected_success"]
+                if (
+                    update["previous"] != old
+                    or any(sid not in self._branch.success_states[tid] for sid in choices.values())
+                    or (choice != "retained" and choice not in choices)
+                ):
+                    raise TaskCuratorContractError("Invalid retained success predecessor or candidates")
+                expected = old if choice == "retained" else choices[choice]
+                if update["retained"] != expected:
+                    raise TaskCuratorContractError("Invalid retained success result")
+                if expected is not None:
+                    self._branch.retained_success[tid] = expected
+            if row["decision"] == "skip":
+                due = row["epoch"] + row["skip_epochs"]
+                if row["skip_epochs"] < 1 or row["next_run_epoch"] != due:
+                    raise TaskCuratorContractError("Invalid cooldown in checkpoint")
+                self._branch.next_run_epoch[tid] = due
+                self._branch.skip_types[tid] = row["skip_type"]
+            else:
+                self._branch.next_run_epoch.pop(tid, None)
+                self._branch.skip_types.pop(tid, None)
+            self._append_history(tid, _history_row_without_output(row))
+
+    def _restore_results(self, entry: dict, parent: int) -> None:
+        results = entry.get("task_curator_results")
+        ids = entry["task_curator_sampled_ids"]
+        if not isinstance(results, list) or [r["task_id"] for r in results] != ids:
+            raise TaskCuratorContractError("Checkpoint is missing aligned parent evaluation results")
+        if any(r.get("candidate_idx") != parent for r in results):
+            raise TaskCuratorContractError("Parent evaluation belongs to a different candidate")
+        self._restore_successes(entry, source="before", candidate_idx=parent)
+        for row in results:
+            self._append_history(row["task_id"], _history_row_without_output(row))
+
+    def _restore_cursor(self, entry: dict) -> None:
+        # Restore sampling progress on the parent before taking the child's
+        # snapshot. Returning to this parent resumes its own cursor/clock.
+        self._branch.epoch = entry["task_curator_epoch"]
+        self._branch.epoch_order = list(entry["task_curator_epoch_order"])
+        self._branch.position = entry["task_curator_position_after_sampling"]
+        self._branch.selected_in_epoch = entry["task_curator_selected_in_epoch_after_sampling"]
+        if (
+            len(self._branch.epoch_order) != len(self._known_ids or ())
+            or set(self._branch.epoch_order) != set(self._known_ids or ())
+            or not 0 <= self._branch.position <= len(self._branch.epoch_order)
+        ):
+            raise TaskCuratorContractError("Invalid saved epoch position")
+
+    def _restore_outcome(self, entry: dict, parent: int, base: _BranchState | None = None) -> None:
+        self._active_candidate_idx = parent
+        actual_parent = self._branch
+        ids = entry["task_curator_sampled_ids"]
+        comparisons = entry.get("task_curator_mutation_results", [])
+        child = entry.get("task_curator_child_idx")
+        if entry.get("new_program_idx") is not None and child is None:
+            raise TaskCuratorContractError("Accepted candidate is missing its curator branch evidence")
+        if comparisons:
+            if [r["task_id"] for r in comparisons] != ids or "task_curator_child_idx" not in entry:
+                raise TaskCuratorContractError("Checkpoint is missing aligned mutation results")
+            accepted = child is not None
+            if any(
+                r["mutation_accepted"] is not accepted
+                or r["before"].get("candidate_idx") != parent
+                or r["after"].get("candidate_idx") != child
+                for r in comparisons
+            ):
+                raise TaskCuratorContractError("Mutation ownership or acceptance differs from checkpoint lineage")
+            if accepted:
+                if entry.get("new_program_idx", child) != child:
+                    raise TaskCuratorContractError("Curator child differs from accepted candidate")
+                if base is not None:
+                    self._branches[parent] = base.fork()
+                self._fork_candidate(child)
+                self._branches[parent] = actual_parent
+            self._restore_successes(entry, source="after", candidate_idx=child)
+            for row in comparisons:
+                self._append_history(row["task_id"], _history_row_without_output(row))
+        elif child is not None or any(s["source"] == "after" for s in entry.get("task_curator_success_states", [])):
+            raise TaskCuratorContractError("Checkpoint has a child without mutation evidence")
+
+    def _restore_batch(self, top: dict) -> None:
+        proposals = top["task_curator_proposals"]
+        if top.get("task_curator_batch_complete") is not True or not isinstance(proposals, list) or len(proposals) < 2:
+            raise TaskCuratorContractError("Incomplete curator batch in checkpoint")
+        entries = {}
+        parents = {}
+        for entry in proposals:
+            pid = entry.get("proposal_id")
+            if (
+                not isinstance(pid, str)
+                or not pid
+                or pid in entries
+                or entry.get("i") != top["i"]
+                or entry.get("task_curator_settings") != self._settings()
+            ):
+                raise TaskCuratorContractError("Invalid proposal identity or settings in checkpoint")
+            entries[pid] = entry
+            parent = self._restore_parent(entry)
+            parents[pid] = parent
+            self._restore_decisions(entry)
+            self._restore_cursor(entry)
+            anchors = [
+                {"task_id": tid, "success_state_id": self._branch.retained_success[tid]}
+                for tid in entry["task_curator_sampled_ids"]
+                if tid in self._branch.retained_success
+            ]
+            if entry.get("task_curator_sampled_anchors") != anchors:
+                raise TaskCuratorContractError("Sampled anchors differ from the proposal's parent history")
+
+        # Replay shared evaluations exactly once on each parent. All siblings
+        # see this common evidence, but no sibling mutation results.
+        evaluated = {}
+        for pid, entry in entries.items():
+            parent = parents[pid]
+            self._active_candidate_idx = parent
+            eid = entry.get("task_curator_evaluation_id")
+            if not isinstance(eid, str) or not eid:
+                raise TaskCuratorContractError("Missing actual evaluation identity")
+            key = (parent, eid)
+            ref = entry.get("task_curator_evaluation_ref")
+            if ref is not None:
+                if (
+                    evaluated.get(key) != ref
+                    or ref not in entries
+                    or entry.get("task_curator_results") != entries[ref].get("task_curator_results")
+                    or entry["task_curator_sampled_ids"] != entries[ref]["task_curator_sampled_ids"]
+                    or any(s["source"] == "before" for s in entry.get("task_curator_success_states", []))
+                ):
+                    raise TaskCuratorContractError("Invalid shared parent evaluation reference")
+            else:
+                if key in evaluated:
+                    raise TaskCuratorContractError("Repeated parent evaluation without an explicit reuse reference")
+                self._restore_results(entry, parent)
+                evaluated[key] = pid
+            if any(r.get("evaluation_id") != eid for r in entry["task_curator_results"]):
+                raise TaskCuratorContractError("Parent result has an incorrect evaluation identity")
+
+        bases = {parent: self._branches[parent].fork() for parent in parents.values()}
+        order = top.get("task_curator_outcome_order", [])
+        outcomes = {pid for pid, e in entries.items() if e.get("task_curator_outcome") in {"accepted", "rejected"}}
+        if len(order) != len(set(order)) or set(order) != outcomes:
+            raise TaskCuratorContractError("Incomplete or duplicate proposal outcomes in checkpoint")
+        children = []
+        for pid, entry in entries.items():
+            status = entry.get("task_curator_outcome")
+            child = entry.get("task_curator_child_idx")
+            comparisons = entry.get("task_curator_mutation_results", [])
+            if status == "skipped":
+                if (
+                    comparisons
+                    or "task_curator_child_idx" in entry
+                    or any(s["source"] == "after" for s in entry.get("task_curator_success_states", []))
+                ):
+                    raise TaskCuratorContractError("Skipped proposal contains mutation evidence")
+            elif status in {"accepted", "rejected"}:
+                if not comparisons or (child is not None) != (status == "accepted"):
+                    raise TaskCuratorContractError("Proposal status differs from its evidence")
+                if any(
+                    r.get("proposal_id") != pid or r.get("evaluation_id") != entry["task_curator_evaluation_id"]
+                    for r in comparisons
+                ):
+                    raise TaskCuratorContractError("Mutation evidence belongs to another proposal")
+                if child is not None:
+                    children.append(child)
+            else:
+                raise TaskCuratorContractError("Unknown proposal outcome")
+        if sorted(children) != sorted(top.get("new_program_indices", [])):
+            raise TaskCuratorContractError("Registered candidates and curator outcomes differ")
+        for pid in order:
+            self._restore_outcome(entries[pid], parents[pid], bases[parents[pid]])
 
     def _restore_successes(self, entry: dict, *, source: str, candidate_idx: int | None) -> None:
         for snapshot in entry.get("task_curator_success_states", []):
@@ -1392,3 +1829,25 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             ):
                 raise TaskCuratorContractError("Invalid success snapshot or candidate in checkpoint")
             self._branch.success_states[tid][sid] = deepcopy(snapshot)
+
+    def _restore_candidate_registration(self, entry: dict) -> None:
+        """Decode version-8 registrations without changing their persisted format."""
+        child_idx = entry.get("task_curator_child_idx")
+        if (
+            entry["task_curator_resumed_seed"] is not True
+            or child_idx is None
+            or entry.get("new_program_idx") != child_idx
+            or entry.get("proposal_accepted") is not True
+            or any(
+                key in entry
+                for key in (
+                    "task_curator_decisions",
+                    "task_curator_sampled_ids",
+                    "task_curator_results",
+                    "task_curator_mutation_results",
+                    "task_curator_success_states",
+                )
+            )
+        ):
+            raise TaskCuratorContractError("Invalid resumed-seed registration in checkpoint")
+        self._fork_candidate(child_idx)

@@ -40,7 +40,7 @@ from gepa.proposer.reflective_mutation.reflection_lm import ReflectionLM, Statel
 from gepa.strategies.batch_sampler import (
     BatchSampler,
     BatchSamplerError,
-    EvaluationAwareBatchSampler,
+    LifecycleAwareBatchSampler,
     ReflectionAwareBatchSampler,
 )
 from gepa.strategies.instruction_proposal import InstructionProposalSignature
@@ -309,6 +309,11 @@ class ReflectiveMutationProposer:
         tasks = self.sampling_strategy.sample_tasks(state, self.candidate_selector, self.batch_sampler, self.trainset)
         if not tasks:
             return []
+        for slot, task in enumerate(tasks):
+            if task.proposal_id is None:
+                task.proposal_id = f"{i}-{slot}"
+        if len({task.proposal_id for task in tasks}) != len(tasks):
+            raise BatchSamplerError("Sampling returned duplicate proposal IDs")
 
         # Fire callbacks for each sampled task
         for task in tasks:
@@ -387,13 +392,15 @@ class ReflectiveMutationProposer:
         )
         state.increment_evals(total_parent_evals)
 
-        if isinstance(self.batch_sampler, EvaluationAwareBatchSampler):
+        if isinstance(self.batch_sampler, LifecycleAwareBatchSampler):
             for task, key in zip(tasks, task_to_key, strict=True):
                 self.batch_sampler.observe_evaluation(
                     iteration=i,
                     task_ids=task.minibatch_ids,
                     evaluation=key_to_eval[key],
                     state=state,
+                    proposal_id=task.proposal_id,
+                    evaluation_id=f"{i}-eval-{key_list.index(key)}",
                 )
 
         # Update evaluation cache for parents
@@ -499,6 +506,7 @@ class ReflectiveMutationProposer:
                         components_to_update=predictor_names,
                         make_reflective_dataset=self.adapter.make_reflective_dataset,
                         state=state,
+                        proposal_id=task.proposal_id,
                     )
                 else:
                     reflective_dataset = self.adapter.make_reflective_dataset(
@@ -613,7 +621,7 @@ class ReflectiveMutationProposer:
             # Stable per-proposal identifier (iteration-taskindex): downstream
             # consumers (run manifests, #346's per-proposal state anchors) can
             # key on this instead of positional inference.
-            _lm_metadata["proposal_id"] = f"{i}-{len(children)}"
+            _lm_metadata["proposal_id"] = task.proposal_id
             for comp in new_texts:
                 _lm_metadata[f"prompt:{comp}"] = prompts.get(comp, "")
                 _lm_metadata[f"raw_lm_output:{comp}"] = raw_outputs.get(comp, "")
@@ -623,7 +631,7 @@ class ReflectiveMutationProposer:
             # reserved prompt:/raw_lm_output: namespaces are remapped so a
             # reflector cannot inject phantom components into proposal tables.
             for meta_key, meta_val in (reflection_metadata or {}).items():
-                if meta_key.startswith(("prompt:", "raw_lm_output:")):
+                if meta_key == "proposal_id" or meta_key.startswith(("prompt:", "raw_lm_output:")):
                     _lm_metadata[f"reflection_meta:{meta_key}"] = meta_val
                 else:
                     _lm_metadata[meta_key] = meta_val
