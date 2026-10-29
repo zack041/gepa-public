@@ -51,10 +51,11 @@ class SamplingStrategy(Protocol[DataId, DataInst]):
 def _sample_task(
     state: GEPAState, batch_sampler: BatchSampler, trainset: DataLoader, parent_idx: int, slot: int
 ) -> ProposalTask:
-    # Allocate identity before curation; filtering/reordering later must not
-    # change which sampling decisions, history, or anchor belong to this job.
-    proposal_id = f"{state.i + 1}-{slot}"
+    proposal_id = None
     if isinstance(batch_sampler, TaskCuratorSampler):
+        # Allocate identity before curation; filtering/reordering later must not
+        # change which sampling decisions, history, or anchor belong to this job.
+        proposal_id = f"{state.i + 1}-{slot}"
         ids = batch_sampler.next_minibatch_ids_for_candidate(
             trainset, state, candidate_idx=parent_idx, proposal_id=proposal_id
         )
