@@ -3,11 +3,13 @@
 
 import random
 from collections import Counter
-from typing import Protocol
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
 
-from gepa.core.adapter import DataInst
+from gepa.core.adapter import DataInst, EvaluationBatch
 from gepa.core.data_loader import DataId, DataLoader
 from gepa.core.state import GEPAState
+from gepa.proposer.base import CandidateProposal
 
 
 class BatchSampler(Protocol[DataId, DataInst]):
@@ -21,6 +23,120 @@ class BatchSampler(Protocol[DataId, DataInst]):
     """
 
     def next_minibatch_ids(self, loader: DataLoader[DataId, DataInst], state: GEPAState) -> list[DataId]: ...
+
+
+class BatchSamplerError(ValueError):
+    """Fatal sampling/evidence contract violation; continuing could corrupt history."""
+
+
+@runtime_checkable
+class CandidateAwareBatchSampler(Protocol[DataId, DataInst]):
+    """Optional sampling interface for state scoped to the explicitly selected parent.
+
+    ``proposal_id`` is allocated at sampling and follows the task through
+    evaluation, reflection, and selection. Ordinary samplers continue to receive
+    ``next_minibatch_ids`` unchanged.
+    """
+
+    def next_minibatch_ids_for_candidate(
+        self,
+        loader: DataLoader[DataId, DataInst],
+        state: GEPAState,
+        *,
+        candidate_idx: int,
+        proposal_id: str | None = None,
+    ) -> list[DataId]: ...
+
+
+@runtime_checkable
+class LifecycleAwareBatchSampler(Protocol[DataId, DataInst]):
+    """Optional parent-evidence and final-outcome observations.
+
+    Parent evidence is delivered even when reflection produces no proposal.
+    ``evaluation_id`` identifies one actual parent execution; multiple proposal
+    IDs may reference it when parent evaluation is deduplicated.
+    Each evaluated proposal receives one final outcome: ``candidate_idx`` is
+    the registered child on acceptance, or None on rejection (including failed
+    validation). Acceptance means entering the pool, not just passing a minibatch.
+
+    A candidate registered without a mutation, such as a new seed on resume,
+    has ``proposal=None`` and a non-None child ID. Its explicit parents define
+    inheritance; validation results must not be treated as training evidence.
+
+    Implementations may set ``requires_sequential_sampling = True`` when each
+    sampling decision must see all previous evaluation/proposal outcomes.
+    """
+
+    def observe_evaluation(
+        self,
+        *,
+        iteration: int,
+        task_ids: Sequence[DataId],
+        evaluation: EvaluationBatch,
+        state: GEPAState,
+        proposal_id: str | None = None,
+        evaluation_id: str | None = None,
+    ) -> None: ...
+
+    def observe_outcome(
+        self,
+        *,
+        iteration: int,
+        parent_ids: Sequence[int],
+        candidate_idx: int | None,
+        proposal: CandidateProposal | None,
+        loader: DataLoader[DataId, DataInst],
+        state: GEPAState,
+    ) -> None: ...
+
+    def finish_iteration(
+        self,
+        *,
+        iteration: int,
+        proposals: Sequence[CandidateProposal] | None,
+        state: GEPAState,
+        aborted_before_registration: bool = False,
+    ) -> None:
+        """Validate all outcomes before checkpointing; None means proposal generation failed.
+
+        ``aborted_before_registration`` means a recoverable engine error occurred
+        before any candidate entered the pool. A sampler may retain parent-only
+        evidence for a single proposal; incomplete multi-proposal batches must
+        still fail closed.
+
+        A returned list may omit jobs with no reflection material. Evaluation IDs
+        identify actual parent executions reused across proposal IDs, not new runs.
+        """
+        ...
+
+
+ReflectiveDatasetBuilder = Callable[
+    [dict[str, str], EvaluationBatch, list[str]], Mapping[str, Sequence[Mapping[str, Any]]]
+]
+
+
+@runtime_checkable
+class ReflectionAwareBatchSampler(Protocol):
+    """Optional reflection assembly before the user's reflective-dataset enricher.
+
+    The sampler receives the original adapter builder and the aligned evaluation
+    and task IDs. It owns any source tracking and enrichment; adapters need no
+    additional metadata or interface changes. Ordinary samplers keep the
+    original whole-minibatch builder call. Components without records are not
+    proposed; if all selected components are empty, the proposal is skipped.
+    """
+
+    def build_reflective_dataset(
+        self,
+        *,
+        candidate: dict[str, str],
+        task_ids: Sequence[DataId],
+        evaluation: EvaluationBatch,
+        components_to_update: list[str],
+        make_reflective_dataset: ReflectiveDatasetBuilder,
+        state: GEPAState,
+        proposal_id: str | None = None,
+    ) -> Mapping[str, Sequence[Mapping[str, Any]]]: ...
 
 
 class EpochShuffledBatchSampler(BatchSampler[DataId, DataInst]):
