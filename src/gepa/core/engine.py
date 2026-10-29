@@ -52,9 +52,9 @@ from gepa.proposer.base import CandidateProposal
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
 from gepa.strategies.acceptance import AcceptanceCriterion, ImprovementOrEqualAcceptance, StrictImprovementAcceptance
-from gepa.strategies.batch_sampler import BatchSamplerError, LifecycleAwareBatchSampler
 from gepa.strategies.eval_policy import EvaluationPolicy, FullEvaluationPolicy
 from gepa.strategies.proposal_selection import AllImprovements, SelectionStrategy
+from gepa.strategies.task_curator import TaskCuratorError, TaskCuratorSampler
 from gepa.utils import StopperProtocol
 
 # Import tqdm for progress bar functionality
@@ -193,8 +193,8 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         self.reflective_proposer = reflective_proposer
         self.merge_proposer = merge_proposer
-        if merge_proposer is not None and getattr(reflective_proposer.batch_sampler, "requires_single_parent", False):
-            raise ValueError("This batch sampler supports single-parent mutations, not multi-parent merge")
+        if merge_proposer is not None and isinstance(reflective_proposer.batch_sampler, TaskCuratorSampler):
+            raise ValueError("Task curator supports single-parent mutations, not multi-parent merge")
         self.frontier_type: FrontierType = frontier_type
 
         # Merge scheduling flags (mirroring previous behavior)
@@ -519,7 +519,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         # All registered children use the same lifecycle path. Mutation evidence
         # and the child fork are observed together; externally supplied seeds
         # carry only their parent/child identity.
-        if isinstance(self.reflective_proposer.batch_sampler, LifecycleAwareBatchSampler):
+        if isinstance(self.reflective_proposer.batch_sampler, TaskCuratorSampler):
             self.reflective_proposer.batch_sampler.observe_outcome(
                 iteration=state.i + 1,
                 parent_ids=parent_program_idx,
@@ -660,7 +660,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         for proposal in proposals:
             if id(proposal) in selected_ids:
                 continue
-            if isinstance(self.reflective_proposer.batch_sampler, LifecycleAwareBatchSampler):
+            if isinstance(self.reflective_proposer.batch_sampler, TaskCuratorSampler):
                 self.reflective_proposer.batch_sampler.observe_outcome(
                     iteration=iteration,
                     parent_ids=proposal.parent_program_ids,
@@ -692,7 +692,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             # Minibatch evidence is complete even if validation fails. None of
             # these candidates entered the pool; preserve their evaluated
             # outcomes before the engine either continues or propagates the error.
-            if isinstance(self.reflective_proposer.batch_sampler, LifecycleAwareBatchSampler):
+            if isinstance(self.reflective_proposer.batch_sampler, TaskCuratorSampler):
                 for proposal in selected:
                     self.reflective_proposer.batch_sampler.observe_outcome(
                         iteration=iteration,
@@ -1161,10 +1161,10 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                         exception=e,
                         will_continue=not self.raise_on_exception
                         and made_progress
-                        and not isinstance(e, BatchSamplerError),
+                        and not isinstance(e, TaskCuratorError),
                     ),
                 )
-                if self.raise_on_exception or not made_progress or isinstance(e, BatchSamplerError):
+                if self.raise_on_exception or not made_progress or isinstance(e, TaskCuratorError):
                     raise e
                 else:
                     continue
@@ -1174,13 +1174,13 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                 if iteration_started:
                     sampler = self.reflective_proposer.batch_sampler
                     # Preserve an already-fatal original error. Otherwise a
-                    # sampler may veto continuing/saving an incomplete batch.
+                    # curator may veto continuing/saving an incomplete batch.
                     propagating_error = iteration_error is not None and (
                         self.raise_on_exception
                         or state.total_num_evals <= evals_before_iteration
-                        or isinstance(iteration_error, BatchSamplerError)
+                        or isinstance(iteration_error, TaskCuratorError)
                     )
-                    if isinstance(sampler, LifecycleAwareBatchSampler) and not propagating_error:
+                    if isinstance(sampler, TaskCuratorSampler) and not propagating_error:
                         sampler.finish_iteration(
                             iteration=state.i + 1,
                             proposals=proposals,

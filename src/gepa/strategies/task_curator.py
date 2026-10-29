@@ -22,7 +22,6 @@ from gepa.core.state import GEPAState
 from gepa.logging.logger import LoggerProtocol
 from gepa.proposer.base import CandidateProposal
 from gepa.proposer.reflective_mutation.base import LanguageModel
-from gepa.strategies.batch_sampler import BatchSamplerError, ReflectiveDatasetBuilder
 
 _TASK_CURATOR_VIEW_KEY = "_task_curator_view"
 _TASK_CURATOR_EVIDENCE_KEY = "task_curator_specific_info"
@@ -195,11 +194,15 @@ def _success_state_id(task_id: Any, iteration: int, source: str) -> str:
     return f"task:{encoded_task_id}/iteration:{iteration}/{source}"
 
 
-class TaskCuratorLMError(BatchSamplerError):
+class TaskCuratorError(ValueError):
+    """Fatal curator failure; continuing could corrupt curriculum state."""
+
+
+class TaskCuratorLMError(TaskCuratorError):
     """An LM callable can raise this for a fatal error that must stop optimization."""
 
 
-class TaskCuratorContractError(BatchSamplerError):
+class TaskCuratorContractError(TaskCuratorError):
     """Curator evidence or checkpoint state is inconsistent with the sampled tasks."""
 
 
@@ -327,8 +330,6 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
     entries automatically. Create a new sampler per optimization run. Full-curator and heuristic anchor modes
     are intentionally not part of this implementation.
     """
-
-    requires_single_parent = True
 
     def __init__(
         self,
@@ -957,7 +958,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 if not isinstance(choice, str) or (choice != "retained" and choice not in pool_candidates):
                     raise ValueError("Missing, invalid, or unavailable selected_success")
                 selected = choice
-        except BatchSamplerError:
+        except TaskCuratorError:
             raise
         except Exception as exc:
             if self.raise_on_error:
@@ -1477,7 +1478,9 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         task_ids: Sequence[DataId],
         evaluation: EvaluationBatch,
         components_to_update: list[str],
-        make_reflective_dataset: ReflectiveDatasetBuilder,
+        make_reflective_dataset: Callable[
+            [dict[str, str], EvaluationBatch, list[str]], Mapping[str, Sequence[Mapping[str, Any]]]
+        ],
         state: GEPAState,
         proposal_id: str | None = None,
     ) -> Mapping[str, Sequence[Mapping[str, Any]]]:

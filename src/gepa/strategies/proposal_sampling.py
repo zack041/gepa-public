@@ -9,7 +9,8 @@ from typing import Generic, Protocol
 from gepa.core.data_loader import DataId, DataInst, DataLoader
 from gepa.core.state import GEPAState
 from gepa.proposer.reflective_mutation.base import CandidateSelector
-from gepa.strategies.batch_sampler import BatchSampler, CandidateAwareBatchSampler
+from gepa.strategies.batch_sampler import BatchSampler
+from gepa.strategies.task_curator import TaskCuratorSampler
 
 
 @dataclass
@@ -53,7 +54,7 @@ def _sample_task(
     # Allocate identity before curation; filtering/reordering later must not
     # change which sampling decisions, history, or anchor belong to this job.
     proposal_id = f"{state.i + 1}-{slot}"
-    if isinstance(batch_sampler, CandidateAwareBatchSampler):
+    if isinstance(batch_sampler, TaskCuratorSampler):
         ids = batch_sampler.next_minibatch_ids_for_candidate(
             trainset, state, candidate_idx=parent_idx, proposal_id=proposal_id
         )

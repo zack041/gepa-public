@@ -37,14 +37,10 @@ from gepa.proposer.reflective_mutation.base import (
     ReflectionComponentSelector,
 )
 from gepa.proposer.reflective_mutation.reflection_lm import ReflectionLM, StatelessReflectionLM
-from gepa.strategies.batch_sampler import (
-    BatchSampler,
-    BatchSamplerError,
-    LifecycleAwareBatchSampler,
-    ReflectionAwareBatchSampler,
-)
+from gepa.strategies.batch_sampler import BatchSampler
 from gepa.strategies.instruction_proposal import InstructionProposalSignature
 from gepa.strategies.proposal_sampling import ProposalTask, SamplingStrategy, SingleMutationSampling
+from gepa.strategies.task_curator import TaskCuratorContractError, TaskCuratorError, TaskCuratorSampler
 
 
 class ReflectiveMutationProposer:
@@ -96,10 +92,6 @@ class ReflectiveMutationProposer:
         self.custom_candidate_proposer = custom_candidate_proposer
         self.callbacks = callbacks
         self.sampling_strategy: SamplingStrategy = sampling_strategy or SingleMutationSampling()
-        if getattr(batch_sampler, "requires_sequential_sampling", False) is True and not isinstance(
-            self.sampling_strategy, SingleMutationSampling
-        ):
-            raise ValueError("This batch sampler requires SingleMutationSampling to observe prior outcomes")
         self.reflective_dataset_enricher = reflective_dataset_enricher
 
         self.reflection_prompt_template = reflection_prompt_template
@@ -312,8 +304,10 @@ class ReflectiveMutationProposer:
         for slot, task in enumerate(tasks):
             if task.proposal_id is None:
                 task.proposal_id = f"{i}-{slot}"
-        if len({task.proposal_id for task in tasks}) != len(tasks):
-            raise BatchSamplerError("Sampling returned duplicate proposal IDs")
+        if isinstance(self.batch_sampler, TaskCuratorSampler) and len({task.proposal_id for task in tasks}) != len(
+            tasks
+        ):
+            raise TaskCuratorContractError("Sampling returned duplicate proposal IDs")
 
         # Fire callbacks for each sampled task
         for task in tasks:
@@ -392,7 +386,7 @@ class ReflectiveMutationProposer:
         )
         state.increment_evals(total_parent_evals)
 
-        if isinstance(self.batch_sampler, LifecycleAwareBatchSampler):
+        if isinstance(self.batch_sampler, TaskCuratorSampler):
             for task, key in zip(tasks, task_to_key, strict=True):
                 self.batch_sampler.observe_evaluation(
                     iteration=i,
@@ -498,7 +492,7 @@ class ReflectiveMutationProposer:
             )
 
             try:
-                if isinstance(self.batch_sampler, ReflectionAwareBatchSampler):
+                if isinstance(self.batch_sampler, TaskCuratorSampler):
                     reflective_dataset = self.batch_sampler.build_reflective_dataset(
                         candidate=task.parent_candidate,
                         task_ids=task.minibatch_ids,
@@ -533,7 +527,7 @@ class ReflectiveMutationProposer:
                         dataset=reflective_dataset_concrete,
                     ),
                 )
-                if isinstance(self.batch_sampler, ReflectionAwareBatchSampler):
+                if isinstance(self.batch_sampler, TaskCuratorSampler):
                     # A curator can omit tasks/components with no usable material.
                     # Custom/adapter proposers must not receive empty reflection jobs.
                     predictor_names = [name for name in predictor_names if reflective_dataset_concrete.get(name)]
@@ -564,7 +558,7 @@ class ReflectiveMutationProposer:
                         reflective_dataset=reflective_dataset_concrete,
                     ),
                 )
-            except BatchSamplerError:
+            except TaskCuratorError:
                 raise
             except Exception as e:
                 self.logger.log(f"Iteration {i}: Exception building reflective dataset: {e}")
