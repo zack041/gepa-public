@@ -42,7 +42,7 @@ We introduce **GEPA-Curator**, an agentic Curator that runs as a harness on top 
 
 ## When Failure Isn't the Prompt's Fault
 
-Reflective prompt optimization is one of the most practical forms of self-improvement we have today: an agent acts in an environment, a Reflector reads the resulting trajectory, and the prompt gets revised for the next round. The whole loop rests on one assumption: **experience from past tasks contains signal that generalizes to future tasks.**
+Reflective prompt optimization is one of the most practical forms of self-improvement we have today: an agent acts in an environment, a Reflector reads the resulting trajectory, and the prompt gets revised for the next round. The whole loop rests on one assumption, that the **experience from past tasks contains signal that generalizes to future tasks.**
 
 A zero score tells the Reflector that the rollout failed. It still has to decide what, if anything, a change to the prompt would fix.
 
@@ -51,16 +51,16 @@ A zero score tells the Reflector that the rollout failed. It still has to decide
   <figcaption>These five rollouts can all end with the same score. A prompt edit can address an agent mistake. A broken webpage or an unreliable judge calls for a different diagnosis.</figcaption>
 </figure>
 
-Consider an agent buying an item on a shopping site. If it fails because it skipped a required option before adding to cart, the Reflector can usefully add "check required fields before proceeding." If it fails because the purchase button was temporarily broken, the "lesson" the Reflector learns ("look for alternative ways to complete the purchase") is noise at best, and actively harmful once the button works again.
+Consider an agent buying an item on a shopping site. If it fails because it skipped a required option before adding to cart, the Reflector can usefully add "check required fields before proceeding." If it fails because the purchase button was temporarily broken, the "lesson" the Reflector learns (e.g. "look for alternative ways to complete the purchase") is noise at best, and actively harmful once the button works again (e.g. "the button does not work, do not waste time trying it").
 
 ### Isn't validation gating enough?
 
-GEPA already guards against bad mutations: it re-evaluates a mutated prompt on the minibatch and only accepts it if the score doesn't drop, and other optimizers use held-out validation sets for the same purpose. But gating has two blind spots:
+GEPA already guards against bad mutations, it re-evaluates a mutated prompt on the minibatch and only accepts it if the score doesn't drop, and other optimizers use held-out validation sets for the same purpose. But gating has two blind spots:
 
 1. **Aggregate scores are noisy.** Stochastic execution and flaky judges mean bad mutations can slip through and good ones can be rejected.
-2. **Gating acts after the fact.** It can veto a bad mutation, but it can't make the reflection itself any better.
+2. **Gating acts after the fact.** It can block a bad mutation, but it can't make the reflection itself any better.
 
-That second point is the key motivation for GEPA-Curator: rather than only filtering what comes *out* of the Reflector, we curate what goes *in*.
+That second point is the key motivation for GEPA-Curator. Rather than only filtering what comes *out* of the Reflector, we curate what goes *in*.
 
 ### Noisy tasks contaminate the prompt
 
@@ -71,15 +71,15 @@ To see how much this matters, we split GoBrowse GitLab tasks into four groups: *
   <figcaption>GitLab validation over 20 iterations. The blue line in each panel tracks the Optimizable tasks. The dashed line tracks the group mixed into training.</figcaption>
 </figure>
 
-With Easy tasks in the mix, GEPA solves 15 of the 16 Optimizable tasks by iteration 12 and reaches 15 again at iteration 20. With Impossible tasks, it peaks at 12 and finishes at 9. With Flaky tasks, its best checkpoint solves 11. The training mix changes how much GEPA learns even on the tasks that a prompt edit can improve.
+With Easy tasks in the mix, GEPA solves 15 of the 16 Optimizable tasks by iteration 12 and reaches 15 again at iteration 20. With Impossible tasks, it peaks at 12 and finishes at 9. With Flaky tasks, its best checkpoint solves 11. The training mix changes how much GEPA learns even on the tasks that we know can be improved by prompt edit.
 
 ### Anatomy of a bad lesson
 
-Here's what contamination looks like up close. In one run, two Impossible tasks failed under the parent prompt; both had underspecified intents that named neither a target repository nor a group, so the actor wandered until it ran out of steps. The judge's feedback suggested browsing more broadly, and the Reflector dutifully turned that into a new rule:
+Here's what contamination looks like up close. In one run, two Impossible tasks failed under the parent prompt, both had underspecified intents that named neither a target repository nor a group, so the actor wandered until it ran out of steps. The judge's feedback suggested browsing more broadly, and the Reflector dutifully turned that into a new rule:
 
 > **Exhaustive Exploration:** Global code search is often limited or disabled. If a search yields no results, manually navigate through groups, projects, and repository file trees. Always check "Your groups", "Your projects", and your personal dashboard before defaulting to public "Explore" tabs, as task resources are usually associated with your account.
 
-The rule did nothing for the Impossible tasks. But it broke a solvable one. On "Check the guide to WCAG documents and standards," the actor had previously opened the A11Y Project from its start page, used *Find file*, and reached the guide in five actions. Under the new prompt, it instead detoured through personal projects, Explore, Topics, Help, global search, and group pages, returned to the A11Y Project, inspected the README and Wiki, and burned all 30 actions in the `src` directory without ever reaching the guide.
+The rule did nothing for the Impossible tasks, but it broke a solvable one. On "Check the guide to WCAG documents and standards," the actor had previously opened the A11Y Project from its start page, used *Find file*, and reached the guide in five actions. Under the new prompt, it instead detoured through personal projects, Explore, Topics, Help, global search, and group pages, returned to the A11Y Project, inspected the README and Wiki, and burned all 30 actions in the `src` directory without ever reaching the guide.
 
 And yet the minibatch score went *up*, from 8 to 9, so the mutation was accepted.
 
@@ -106,7 +106,7 @@ The default under uncertainty is to **run**, not skip: a rollout has information
 
 ### Prior Success Retrieval: compare, don't guess
 
-A standard Reflector sees only the failed trajectory and its evaluation, and has to diagnose the failure from that alone. GEPA-Curator gives it something better: a **trusted past success on the same task**. With a failed and a successful trajectory side by side, the Reflector can perform a kind of contrastive diagnosis: *what did the agent do differently when it worked?*
+A standard Reflector sees only the failed trajectory and its evaluation, and has to diagnose the failure from that alone. GEPA-Curator gives it something better: a **trusted past success on the same task**. With a failed and a successful trajectory side by side, the Reflector can perform a kind of contrastive diagnosis, asking what did the agent do differently when it worked?
 
 In the current implementation, the Curator keeps one reference success per task in each prompt lineage. It can select a single convincing rollout as that reference. The Curator looks for repeated clean successes across separate rollouts before calling a task *mastered*.
 
@@ -128,7 +128,7 @@ For a skip, the Curator sets a positive `skip_epochs` and uses `skip_type` of `m
 
 ## Results
 
-We use gpt-oss-120b as the actor and evaluate two optimizer models, Gemini 3.1 Pro and Claude Opus 5, which drive all optimizer-side agents (Reflector and Curator) in a run. GEPA-Curator builds on a simplified, greedy variant of GEPA that keeps a single lineage instead of a Pareto pool; in our ablation, removing Pareto selection made little difference for GEPA (82.8 vs. 82.5). All numbers are held-out test success rates averaged over 5 runs.
+We use gpt-oss-120b as the actor and evaluate two optimizer models, Gemini 3.1 Pro and Claude Opus 5, which drive all optimizer-side agents (Reflector and Curator) in a run. GEPA-Curator builds on a simplified, greedy variant of GEPA that keeps a single lineage instead of a Pareto pool. All numbers are held-out test success rates averaged over 5 runs.
 
 ### WebArena (GoBrowse) {#webarena}
 
@@ -194,13 +194,13 @@ Across the four GoBrowse runs, the Curator flagged 75 of 1,581 training tasks (4
 
 **Most "impossible" diagnoses trace back to the harness or environment** (12 of 18), such as a required tool being unavailable. For flaky diagnoses, **faulty or underspecified task descriptions are the leading cause** (30 of 65), followed by harness/environment limitations, which can lead a lenient judge to accept an actor's claim that a task can't be done.
 
-The Curator also adjusts *how often* it revisits tasks rather than retiring them. Impossible tasks are deferred the longest, with mean skip streaks growing from 5.5 to 8.75 epochs over training; mastered tasks are deferred longer over time but periodically rechecked for regressions; flaky tasks are revisited more often to resolve uncertainty.
+The Curator also adjusts *how often* it revisits tasks rather than retiring them. Impossible tasks are deferred the longest, with mean skip streaks growing from 5.5 to 8.75 epochs over training. Mastered tasks are deferred longer over time but periodically rechecked for regressions. Flaky tasks are revisited more often to resolve uncertainty.
 
 <!-- figure of [new, optional]: mean skip-streak length before rerun by phase (early / middle / late) for Mastered, Impossible, and Flaky tasks — from Table 12 in the appendix. -->
 
 ### How often does the Reflector get a reference success?
 
-As optimization proceeds, successes accumulate and retrieval kicks in more often: the share of failed reflections paired with a trusted success rises from **6.9% early to about 50%** in the middle and late phases. The Curator is also selective: for 11.6% of eligible tasks, it made a non-trivial judgment about the success pool, either picking a reliable success over a noisy one or explicitly abstaining because every available "success" looked contaminated or evaluator-lenient.
+As optimization proceeds, successes accumulate and retrieval kicks in more often: the share of failed reflections paired with a trusted success rises from **6.9% early to about 50%** in the middle and late phases. For 11.6% of eligible tasks, the Curator made a non-trivial judgment about the success pool, either picking a reliable success over a noisy one or explicitly abstaining because every available "success" looked contaminated or evaluator-lenient.
 
 ## Beyond Prompts: Curating Harness Optimization {#meta-harness}
 
