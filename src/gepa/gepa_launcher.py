@@ -140,7 +140,6 @@ from gepa.core.state import EvaluationCache, FrontierType
 from gepa.image import Image  # noqa: F401 — re-exported for user convenience
 from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import Logger, LoggerProtocol, StdOutLogger
-from gepa.oa.budget import BudgetExhausted
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.base import CandidateSelector, LanguageModel, ReflectionComponentSelector
 from gepa.proposer.reflective_mutation.reflection_lm import ReflectionLM
@@ -1067,8 +1066,6 @@ class EvaluatorWrapper:
                     stderr_capturer.start_capture()
 
                 result = evaluator_fn(eval_candidate, **filtered)
-            except BudgetExhausted:
-                raise
             except Exception as e:
                 result = e  # Sentinel; handled below after cleanup
             finally:
