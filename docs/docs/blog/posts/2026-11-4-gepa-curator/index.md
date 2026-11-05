@@ -124,7 +124,31 @@ When a task comes up for a decision, the same Curator call handles scheduling an
 
 For a skip, the Curator sets a positive `skip_epochs` and uses `skip_type` of `mastered` or `low_signal`. It includes `selected_success` only when an eligible success is offered. It can choose an offered `before` or `after` rollout, or choose `retained` to keep the existing reference, even when the reference is empty.
 
-<!-- TODO: if GEPA-Curator ships in the gepa package, add a short usage snippet here in the style of the optimize_anything post (e.g., how to enable the Curator on top of an existing GEPA run). -->
+### Try it on an existing GEPA run
+
+The integration exposes the efficient Curator as a batch sampler. Pass it to `gepa.optimize` alongside your existing adapter, datasets, and evaluation budget. Here, `reflection_lm` is a callable that takes a prompt and returns text. The selector follows the latest accepted prompt, as in the paper’s greedy search.
+
+<!-- Link to the upstream gepa-ai/gepa implementation PR here once it is open. -->
+
+```python
+import gepa
+from gepa.strategies.task_curator import TaskCuratorSampler
+
+
+class LatestAccepted:
+    def select_candidate_idx(self, state):
+        return len(state.program_candidates) - 1
+
+
+result = gepa.optimize(
+    seed_candidate=seed_candidate, trainset=trainset, valset=valset,
+    adapter=adapter, reflection_lm=reflection_lm, max_metric_calls=max_metric_calls,
+    batch_sampler=TaskCuratorSampler(lm=reflection_lm, minibatch_size=16),
+    candidate_selection_strategy=LatestAccepted(),
+)
+```
+
+Set the minibatch size on the sampler itself. By default, the Curator keeps the three most recent execution units in detail and can give the Reflector a retained success when the same task later fails.
 
 ## Results
 
