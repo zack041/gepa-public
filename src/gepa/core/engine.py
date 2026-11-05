@@ -48,6 +48,7 @@ from gepa.gepa_utils import json_default, try_json_serialize
 from gepa.logging.experiment_tracker import ExperimentTracker
 from gepa.logging.logger import LoggerProtocol
 from gepa.logging.utils import log_detailed_metrics_after_discovering_new_program
+from gepa.oa.budget import BudgetExhausted
 from gepa.proposer.base import CandidateProposal
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
@@ -688,6 +689,8 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
         # 3) Full-valset eval of the selected candidates (one batched, read-only call).
         try:
             valset_evals = self._evaluate_programs_on_valset([p.candidate for p in selected], state)
+        except BudgetExhausted:
+            raise
         except Exception:
             # Minibatch evidence is complete even if validation fails. None of
             # these candidates entered the pool; preserve their evaluated
@@ -1147,6 +1150,10 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
                 proposal_accepted = self._run_reflective_batch(proposals, state)
 
+            except BudgetExhausted as e:
+                # The OA launcher returns the last complete checkpoint.
+                iteration_error = e
+                raise
             except Exception as e:
                 iteration_error = e
                 self.logger.log(f"Iteration {state.i + 1}: Exception during optimization: {e}")
@@ -1178,7 +1185,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
                     propagating_error = iteration_error is not None and (
                         self.raise_on_exception
                         or state.total_num_evals <= evals_before_iteration
-                        or isinstance(iteration_error, TaskCuratorError)
+                        or isinstance(iteration_error, (BudgetExhausted, TaskCuratorError))
                     )
                     if isinstance(sampler, TaskCuratorSampler) and not propagating_error:
                         sampler.finish_iteration(

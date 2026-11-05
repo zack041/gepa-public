@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from numbers import Real
 from typing import Any, Generic
 
@@ -25,7 +26,6 @@ from gepa.proposer.reflective_mutation.base import LanguageModel
 
 _TASK_CURATOR_VIEW_KEY = "_task_curator_view"
 _TASK_CURATOR_EVIDENCE_KEY = "task_curator_specific_info"
-_LEGACY_PRESENTATION_FIELDS = ("Task", "Score", "JudgeFeedback", "Error", "EvalFailures", "ReferenceEvaluation")
 _EVIDENCE_EVENTS = frozenset({"evaluation_result", "mutation_comparison"})
 _CURATOR_DECISION_EVENTS = frozenset({"curator_decision", "curator_anchor_decision"})
 _TASK_STATUSES = frozenset(
@@ -98,95 +98,52 @@ def _task_view(task: Any) -> Any:
     return _json_safe(task)
 
 
-def _uses_legacy_evidence_schema(trajectory: Any) -> bool:
-    """Recognize a complete legacy record or its explicit evaluation packet.
-
-    A common field such as Score or Error alone is not a schema declaration.
-    Partial records need the namespaced packet; otherwise preserve all evidence.
-    """
-    return isinstance(trajectory, dict) and (
-        all(field in trajectory for field in _LEGACY_PRESENTATION_FIELDS)
-        or (
-            isinstance(trajectory.get("evaluation_evidence_specific_info"), dict)
-            and any(field in trajectory for field in _LEGACY_PRESENTATION_FIELDS)
-        )
-    )
-
-
-def _evaluator_feedback(trajectory: Any) -> Any:
-    if not isinstance(trajectory, dict):
-        return _json_safe(trajectory)
-
-    curator_evidence = trajectory.get(_TASK_CURATOR_EVIDENCE_KEY)
-    if curator_evidence is not None:
-        return _json_safe(curator_evidence)
-
-    # Optional legacy evidence schema; no benchmark implementation is needed.
-    if not _uses_legacy_evidence_schema(trajectory):
-        return _json_safe(trajectory)
-
-    summary = {field: _json_safe(trajectory.get(field)) for field in _LEGACY_PRESENTATION_FIELDS}
-    packet = trajectory.get("evaluation_evidence_specific_info")
-    if isinstance(packet, dict):
-        summary["Evaluation"] = {
-            field: _json_safe(packet.get(field))
-            for field in (
-                "evaluation_status",
-                "evaluation_types",
-                "evaluation_feedback",
-                "error",
-                "trajectory_complete",
-                "execution_stage",
-            )
-        }
-    return summary
-
-
-def _historical_success_state(trajectory: Any) -> Any:
+def _default_evidence(trajectory: Any) -> Any:
+    """Honor an explicit curator view; otherwise preserve the supplied trajectory."""
     if isinstance(trajectory, dict) and trajectory.get(_TASK_CURATOR_EVIDENCE_KEY) is not None:
-        return _json_safe(trajectory[_TASK_CURATOR_EVIDENCE_KEY])
+        return trajectory[_TASK_CURATOR_EVIDENCE_KEY]
+    return trajectory
 
-    summary = _evaluator_feedback(trajectory)
-    if not isinstance(summary, dict):
-        return summary
-    # Only project the legacy presentation format. Other adapters can supply
-    # arbitrary evidence without having it replaced by empty legacy fields.
-    if not _uses_legacy_evidence_schema(trajectory):
-        return summary
 
-    evaluation = summary.get("Evaluation")
-    evaluation_feedback = evaluation.get("evaluation_feedback") if isinstance(evaluation, dict) else None
-    evaluator_feedback = summary.get("JudgeFeedback") or evaluation_feedback
+class _EvidenceDefault(Enum):
+    SOURCE = "source"
 
-    state = {
-        "Task": summary.get("Task"),
-        "Score": summary.get("Score"),
-        "EvaluatorFeedback": _json_safe(evaluator_feedback),
-        "ReferenceEvaluation": _json_safe(summary.get("ReferenceEvaluation")),
-    }
-    return state
+
+@dataclass(frozen=True)
+class CuratorEvidence:
+    """User-controlled views of one evaluation, returned by ``evidence_fn``.
+
+    ``history`` is shown for recent executions; ``summary`` supplements the
+    score/outcome metadata after an execution leaves ``history_window``.
+    ``success`` is shown when selecting an anchor and later during reflection.
+    Omitted history and success independently use the original source evidence
+    (the explicit ``task_curator_specific_info`` packet, or the trajectory).
+    Explicit ``history=None`` shows metadata only; ``success=None`` declines to
+    provide an anchor. Values must be JSON-serializable, not opaque objects.
+    The curator snapshots them once and restores those snapshots on resume.
+    """
+
+    history: Any = _EvidenceDefault.SOURCE
+    summary: Any = None
+    success: Any = _EvidenceDefault.SOURCE
 
 
 def _history_row_without_output(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key not in {"task_id", "output"}}
 
 
-def _is_clean_success(score: float, trajectory: Any) -> bool:
-    if score != 1.0:
-        return False
-    if not isinstance(trajectory, dict):
-        return True
-    if trajectory.get("Error") or trajectory.get("error") or trajectory.get("EvalFailures"):
-        return False
-    packet = trajectory.get("evaluation_evidence_specific_info")
-    if not isinstance(packet, dict):
-        return True
-    status = str(packet.get("evaluation_status", "")).strip().lower()
-    if status and status != "success":
-        return False
-    if packet.get("trajectory_complete") is False:
-        return False
-    return not packet.get("error")
+def _default_success(score: float, trajectory: Any) -> bool:
+    return score == 1.0
+
+
+def _reported_crash(trajectory: Any) -> bool:
+    """Only a producer's explicit per-rollout flag establishes a recovered crash."""
+    packet = _default_evidence(trajectory)
+    return any(
+        isinstance(record, dict)
+        and (record.get("infrastructure_error") is True or record.get("_gepa_transient_failure") is True)
+        for record in (trajectory, packet)
+    )
 
 
 def _success_state_id(task_id: Any, iteration: int, source: str) -> str:
@@ -282,29 +239,44 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
 
     ``history_window`` defaults to 3 execution units, with a before/after pair
     counting once. Older units keep outcomes and curator assessments. ``None`` keeps all
-    units in detail. Full evidence and decisions remain in the GEPA trace for
+    units in detail. Extracted evidence and decisions remain in the GEPA trace for
     audit and resume; the window limits prompt detail, not stored evidence.
 
     Default extraction honors ``_task_curator_view`` on tasks and
     ``task_curator_specific_info`` on trajectories. Without a dedicated packet,
-    complete legacy evaluator records (or partial records with an explicit
-    evaluation packet) use selected fields for history and a smaller success
-    reference. Other formats pass through intact, even when they contain common
-    keys such as Task, Score or Error. Raw rollout artifacts outside an explicit
-    packet are not included in that view.
-    These legacy field names are optional compatibility conventions; arbitrary
-    task/trajectory formats work without benchmark packages or services.
+    the supplied trajectory is retained without filtering its field names.
+    Default serialization represents opaque objects with str(); use ``evidence_fn``
+    for a meaningful projection of custom objects or images.
+    Raw rollout artifacts outside an explicit packet are not included in that view.
 
-    ``task_view``, ``evidence_extractor``, and ``success_extractor`` can override
-    those views. A custom ``evidence_extractor`` also supplies success references
-    unless ``success_extractor`` is set separately. Their outputs are converted
-    to JSON-safe values. Evidence must include what the curator needs to judge
-    correctness. The default ``is_success`` requires score == 1 and excludes
-    explicit evaluation errors, non-success evaluation status, and incomplete
-    evaluation packets. ``is_failure`` defaults to score <= 0. Both predicates
-    receive the score and the original trajectory; override them for other metrics.
-    Success snapshots and pool eligibility share this single success predicate.
-    Missing trajectories cannot supply an anchor.
+    ``task_view`` controls task descriptions. Optional ``evidence_fn(candidate,
+    evaluation)`` returns :class:`CuratorEvidence`: separate recent-history,
+    older-summary, and success views. It receives an ``EvaluationBatch`` for one
+    task, including original score, output, trajectory and objective scores;
+    ``num_metric_calls`` is None because the batch cost cannot be apportioned.
+    The candidate is the one that produced this evaluation, even for rejected
+    mutations. Both omitted history and omitted success use the source evidence
+    independently. A short history does not silently shorten a success reference.
+    Callbacks must not mutate their inputs. Views must be JSON-serializable;
+    provide a projection for opaque objects or images rather than relying on str().
+    Each evaluation's views are recorded once and restored unchanged on resume;
+    formatting is not rerun for shared parent evaluations or before/after pairing.
+    Changing the callback only affects new records; previously omitted evidence
+    cannot be recovered from the curator trace. Metadata such as score, outcome,
+    task identity and lineage remains curator-owned, outside user views.
+
+    Legacy ``evidence_extractor`` and ``success_extractor`` remain supported but
+    cannot be combined with ``evidence_fn``. They receive the original trajectory;
+    a custom history extractor still supplies the success view unless separately
+    overridden, and their outputs retain the previous JSON-safe conversion.
+    A success extractor returning None declines to provide an anchor.
+    Evidence must include what the curator needs to judge
+    correctness. An explicitly reported recovered evaluator crash takes precedence.
+    By default, score == 1 is a success and any other finite score is a failure.
+    Optional predicates receive the score and original trajectory. If an explicit
+    failure predicate also declines a non-success, the outcome is unknown.
+    Only successes supply anchors, and only task failures receive them.
+    Without an explicit success view, missing trajectories cannot supply an anchor.
 
     A skip of N includes the current epoch. The task runs automatically at
     epoch + N without another LLM call. Small epoch-tail batches are allowed.
@@ -342,6 +314,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         history_window: int | None = 3,
         use_reflection_anchors: bool = True,
         task_view: Callable[[DataInst], Any] | None = None,
+        evidence_fn: Callable[[dict[str, str], EvaluationBatch], CuratorEvidence] | None = None,
         evidence_extractor: Callable[[Any], Any] | None = None,
         success_extractor: Callable[[Any], Any] | None = None,
         is_success: Callable[[float, Any], bool] | None = None,
@@ -359,6 +332,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             raise ValueError("seed must be an integer")
         if not isinstance(use_reflection_anchors, bool) or not isinstance(raise_on_error, bool):
             raise ValueError("use_reflection_anchors and raise_on_error must be booleans")
+        if evidence_fn is not None and (evidence_extractor is not None or success_extractor is not None):
+            raise ValueError("Use evidence_fn or the legacy extractors, not both")
         self.minibatch_size = minibatch_size
         self.lm = lm
         self.logger = logger
@@ -367,16 +342,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         self.history_window = history_window
         self.use_reflection_anchors = use_reflection_anchors
         self.task_view = task_view if task_view is not None else _task_view
-        self.evidence_extractor = evidence_extractor if evidence_extractor is not None else _evaluator_feedback
-        self.success_extractor = (
-            success_extractor
-            if success_extractor is not None
-            else evidence_extractor
-            if evidence_extractor is not None
-            else _historical_success_state
-        )
-        self.is_success = is_success if is_success is not None else _is_clean_success
-        self.is_failure = is_failure or (lambda score, trajectory: score <= 0)
+        self.evidence_fn = evidence_fn
+        self._legacy_extractors = evidence_extractor is not None or success_extractor is not None
+        self.evidence_extractor = evidence_extractor if evidence_extractor is not None else _default_evidence
+        self.success_extractor = success_extractor if success_extractor is not None else self.evidence_extractor
+        self.is_success = is_success if is_success is not None else _default_success
+        self.is_failure = is_failure
+        self._custom_metrics = is_success is not None or is_failure is not None
         self.raise_on_error = raise_on_error
         self._branches: dict[int, _BranchState] = {0: _BranchState()}
         self._active_candidate_idx = 0
@@ -620,7 +592,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             "minibatch_size": self.minibatch_size,
             "seed": self.seed,
             "use_reflection_anchors": self.use_reflection_anchors,
-            "uses_default_success": self.is_success is _is_clean_success,
+            "uses_default_success": self.is_success is _default_success,
         }
 
     def _trace_entry(self, state: GEPAState, iteration: int) -> dict:
@@ -728,36 +700,28 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         rows = self._execution_units(task_id)
         return rows if self.history_window is None else rows[-self.history_window :]
 
-    @staticmethod
-    def _compact_outcome(row: dict[str, Any]) -> str:
-        feedback = row.get("evaluator_feedback")
-        feedback = feedback if isinstance(feedback, dict) else {}
-        packet = feedback.get("Evaluation") or feedback.get("evaluation_evidence_specific_info") or {}
-        packet = packet if isinstance(packet, dict) else {}
-        status = str(packet.get("evaluation_status") or feedback.get("evaluation_status") or "").lower()
-        error = feedback.get("Error") or feedback.get("error") or packet.get("error")
-        if feedback.get("infrastructure_error") or status in {"timeout", "infrastructure_error"}:
+    def _rollout_outcome(self, score: float, trajectory: Any) -> str:
+        if _reported_crash(trajectory):
             return "infrastructure_error"
-        if error and any(
-            word in str(error).lower() for word in ("timeout", "timed out", "connection", "reset", "network")
-        ):
-            return "infrastructure_error"
-        # Actor failures are task failures, not evidence of a broken evaluator.
-        if feedback.get("actor_error"):
-            return "fail"
-        # Preserve independently reported evaluation errors separately.
-        if error or feedback.get("EvalFailures") or status in {"error", "invalid"}:
-            return "error"
-        if packet.get("trajectory_complete") is False:
-            return "incomplete"
-        score = row.get("score")
-        if not isinstance(score, Real) or not math.isfinite(float(score)):
-            return "unknown"
-        if score == 1:
+        if self.is_success(score, trajectory):
             return "success"
-        if score == 0:
+        if self.is_failure is None or self.is_failure(score, trajectory):
             return "fail"
-        return f"score={score:g}"
+        return "unknown"
+
+    def _compact_outcome(self, row: dict[str, Any]) -> str:
+        """Read saved outcomes, including checkpoints that inferred labels from text."""
+        saved = row.get("outcome")
+        if saved in ("success", "fail", "unknown"):
+            return saved
+        # New crash rows keep provenance even when a formatter omits the marker.
+        # Older infrastructure labels alone could have come from a timeout message.
+        if row.get("recovered_crash") is True or _reported_crash(row.get("evaluator_feedback")):
+            return "infrastructure_error"
+        score = row.get("score")
+        if self._custom_metrics or not isinstance(score, Real) or not math.isfinite(float(score)):
+            return "unknown"
+        return "success" if score == 1 else "fail"
 
     def _execution_assessments(self, task_id: DataId) -> dict[tuple[Any, Any], dict[str, Any]]:
         assessments = {}
@@ -788,10 +752,19 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                     mutation_accepted=row.get("mutation_accepted"),
                     before_candidate_idx=row.get("before", {}).get("candidate_idx"),
                     after_candidate_idx=row.get("after", {}).get("candidate_idx"),
+                    before_score=row.get("before", {}).get("score"),
+                    after_score=row.get("after", {}).get("score"),
                 )
+                for side in ("before", "after"):
+                    evidence = row.get(side, {}).get("evidence_summary")
+                    if evidence is not None:
+                        summary[f"{side}_evidence"] = evidence
             else:
                 summary["outcome"] = self._compact_outcome(row)
                 summary["candidate_idx"] = row.get("candidate_idx")
+                summary["score"] = row.get("score")
+                if row.get("evidence_summary") is not None:
+                    summary["evidence"] = row["evidence_summary"]
             summaries.append(summary)
         return summaries
 
@@ -821,6 +794,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                     "anchor_reason",
                     "proposal_id",
                     "evaluation_id",
+                    "evidence_summary",
+                    "recovered_crash",
                 }:
                     continue
                 if key == "success_state_id":
@@ -889,8 +864,9 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             "without a credible relationship to prompt changes, or there is explicit evidence of an incorrect label, "
             "stale or contradictory target, or evaluator expectation inconsistent with the user request. Do not infer "
             "this from one disagreement, inconsistent actor behavior, or an unusually strict or difficult evaluator.\n"
-            "- Infrastructure failure: timeout, reset, network errors, or local-state/file collisions caused by missing "
-            "resets provide no evidence about prompt quality. Do not interpret them as agent failures.\n"
+            "- Rollout outcomes: success and fail record task results. An actor that times out with a failure score "
+            "has a failed rollout. infrastructure_error records a recovered execution crash explicitly reported for "
+            "that rollout. unknown means its outcome could not be classified.\n"
             "- Uncertain: run rather than skip. A rollout has information value: use it to test uncertain mastery, "
             "suspected flakiness, possible regressions, or ambiguous failure mechanisms.\n\n"
             "Run unseen or underexplored tasks and tasks with credible prompt-sensitive failures. Skip only when the "
@@ -926,28 +902,28 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 retained["success_state"] if retained else None, ensure_ascii=False, indent=2
             )
             if pool_candidates:
+                eligible = {}
+                for side, sid in pool_candidates.items():
+                    latest = prompt_history[-1]
+                    paired = latest.get("event") == "mutation_comparison"
+                    history_evidence = (latest[side] if paired else latest).get("evaluator_feedback")
+                    success_evidence = self._branch.success_states[task_id][sid]["success_state"]
+                    eligible[side] = (
+                        (f"History[-1].{side}.evaluator_feedback" if paired else "History[-1].evaluator_feedback")
+                        if json.dumps(success_evidence, sort_keys=True) == json.dumps(history_evidence, sort_keys=True)
+                        else {"successful_state": success_evidence}
+                    )
                 prompt += (
                     "\n\nThe latest execution unit contains successful rollouts. Choose a reference success for "
-                    "future reflection from the retained success and the eligible successful rollouts in History. "
+                    "future reflection from the retained success and the eligible successful rollouts below. "
                     "Consider genuine task completion, reproducibility, and clear, efficient execution. "
                     "If a retained success exists, replace it only if another success provides a better reference. "
                     'Include "selected_success": "retained", "before", or "after" in your JSON response. '
                     '"retained" leaves the pool unchanged, including when it is empty. '
                     '"before" or "after" stores that successful trajectory. Only choose a side listed below; '
                     "failed sides are not eligible. A success remains eligible even if its mutation was rejected."
-                    "\n\nEligible successes (references to the latest History entry; use its evidence above):\n"
-                    + json.dumps(
-                        {
-                            side: (
-                                f"History[-1].{side}.evaluator_feedback"
-                                if prompt_history[-1].get("event") == "mutation_comparison"
-                                else "History[-1].evaluator_feedback"
-                            )
-                            for side in pool_candidates
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
+                    "\n\nEligible successes (the exact success evidence, or a reference when identical to History):\n"
+                    + json.dumps(eligible, ensure_ascii=False, indent=2)
                 )
         try:
             payload = self._parse_response(self.lm(prompt))
@@ -1121,6 +1097,79 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             ]
         return selected
 
+    def _prepare_evidence(
+        self, candidate: dict[str, str], evaluation: EvaluationBatch
+    ) -> list[tuple[dict[str, Any], Any]]:
+        """Snapshot views before committing any task's history or success state."""
+        count = len(evaluation.scores)
+        for name in ("outputs", "trajectories", "objective_scores"):
+            values = getattr(evaluation, name)
+            if values is not None and len(values) != count:
+                raise TaskCuratorContractError(f"Curator evaluation {name} are misaligned")
+        prepared = []
+        for index, score in enumerate(evaluation.scores):
+            if not isinstance(score, Real) or not math.isfinite(float(score)):
+                raise TaskCuratorContractError(f"Task curator received invalid score: {score!r}")
+            trajectory = evaluation.trajectories[index] if evaluation.trajectories is not None else None
+            try:
+                outcome = self._rollout_outcome(score, trajectory)
+                succeeded = outcome == "success"
+                source = _default_evidence(trajectory)
+                if self.evidence_fn is not None:
+                    single = replace(
+                        evaluation,
+                        outputs=[evaluation.outputs[index]],
+                        scores=[score],
+                        trajectories=None if evaluation.trajectories is None else [trajectory],
+                        objective_scores=(
+                            None if evaluation.objective_scores is None else [evaluation.objective_scores[index]]
+                        ),
+                        num_metric_calls=None,
+                    )
+                    views = self.evidence_fn(dict(candidate), single)
+                    if not isinstance(views, CuratorEvidence):
+                        raise TypeError("evidence_fn must return CuratorEvidence")
+                elif self._legacy_extractors:
+                    views = CuratorEvidence(
+                        history=self.evidence_extractor(trajectory),
+                        success=(
+                            self.success_extractor(trajectory)
+                            if succeeded and self.use_reflection_anchors and trajectory is not None
+                            else None
+                        ),
+                    )
+                else:
+                    views = CuratorEvidence()
+
+                def snapshot(value: Any, source: Any = source) -> Any:
+                    value = source if value is _EvidenceDefault.SOURCE else value
+                    if self.evidence_fn is None:
+                        return _json_safe(value)
+                    # Formatting is explicit: never silently replace a rich
+                    # trajectory or image with its Python string representation.
+                    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+                row = {
+                    "score": float(score),
+                    "outcome": outcome,
+                    "evaluator_feedback": snapshot(views.history),
+                }
+                if outcome == "infrastructure_error":
+                    row["recovered_crash"] = True
+                if views.summary is not None:
+                    row["evidence_summary"] = snapshot(views.summary)
+                success = snapshot(views.success) if succeeded and self.use_reflection_anchors else None
+                prepared.append((row, success))
+            except TaskCuratorError:
+                raise
+            except Exception as exc:
+                raise TaskCuratorContractError(
+                    f"Cannot prepare curator evidence for evaluation item {index}: {exc}. "
+                    "evidence_fn must return CuratorEvidence with JSON-serializable views; "
+                    "set history/success explicitly for opaque trajectories."
+                ) from exc
+        return prepared
+
     def _record_success_state(
         self,
         *,
@@ -1128,11 +1177,11 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         iteration: int,
         source: str,
         score: float,
-        trajectory: Any,
+        success: Any,
         state: GEPAState,
         mutation_accepted: bool | None = None,
     ) -> str | None:
-        if trajectory is None or not self.use_reflection_anchors or not self.is_success(score, trajectory):
+        if success is None or not self.use_reflection_anchors:
             return None
         success_state_id = _success_state_id(task_id, iteration, source)
         if len(self._contexts) > 1:
@@ -1146,7 +1195,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             "source": source,
             "candidate_idx": self._active_candidate_idx if source == "before" or mutation_accepted else None,
             "score": float(score),
-            "success_state": _json_safe(self.success_extractor(trajectory)),
+            "success_state": success,
         }
         if mutation_accepted is not None:
             snapshot["mutation_accepted"] = bool(mutation_accepted)
@@ -1168,6 +1217,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         outputs: Sequence[Any],
         trajectories: Sequence[Any],
         state: GEPAState,
+        evaluation: EvaluationBatch | None = None,
     ) -> None:
         parent_idx = self._check_iteration_parent(iteration)
         entry = self._trace_entry(state, iteration)
@@ -1185,6 +1235,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             raise TaskCuratorContractError(f"Task curator first-pass fields are misaligned at iteration {iteration}.")
 
         context = self._context
+        if evaluation is None:
+            evaluation = EvaluationBatch(outputs=list(outputs), scores=list(scores), trajectories=list(trajectories))
         if self._parent_bases:
             raise TaskCuratorContractError("Cannot append parent evidence after outcomes began")
         if len(self._contexts) > 1:
@@ -1199,35 +1251,28 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                     and "task_curator_results" in previous.entry
                 ):
                     rows = previous.entry["task_curator_results"]
-                    if (
-                        [r["task_id"] for r in rows] != list(task_ids)
-                        or [r["score"] for r in rows] != list(scores)
-                        or [r["evaluator_feedback"] for r in rows]
-                        != [_json_safe(self.evidence_extractor(t)) for t in trajectories]
-                    ):
+                    if [r["task_id"] for r in rows] != list(task_ids) or [r["score"] for r in rows] != list(scores):
                         raise TaskCuratorContractError("Reused evaluation ID has different evidence")
                     entry["task_curator_evaluation_ref"] = previous.proposal_id
                     entry["task_curator_results"] = rows
                     return
+        prepared = self._prepare_evidence(state.program_candidates[parent_idx], evaluation)
         results = []
-        for task_id, score, _output, trajectory in zip(task_ids, scores, outputs, trajectories, strict=True):
-            if not isinstance(score, Real) or not math.isfinite(float(score)):
-                raise TaskCuratorContractError(f"Task curator received invalid score for task {task_id!r}: {score!r}.")
+        for task_id, (evidence, success) in zip(task_ids, prepared, strict=True):
             row = {
                 "event": "evaluation_result",
                 **self._evidence_metadata(),
                 "candidate_idx": parent_idx,
                 "epoch": entry["task_curator_epoch"] if len(self._contexts) > 1 else self._branch.epoch,
                 "iteration": iteration,
-                "score": float(score),
-                "evaluator_feedback": _json_safe(self.evidence_extractor(trajectory)),
+                **evidence,
             }
             success_state_id = self._record_success_state(
                 task_id=task_id,
                 iteration=iteration,
                 source="before",
-                score=float(score),
-                trajectory=trajectory,
+                score=evidence["score"],
+                success=success,
                 state=state,
             )
             if success_state_id is not None:
@@ -1250,6 +1295,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         mutation_accepted: bool,
         state: GEPAState,
         candidate_idx: int | None = None,
+        after_candidate: dict[str, str] | None = None,
+        after_evaluation: EvaluationBatch | None = None,
     ) -> None:
         """Commit all child evidence together; failed extraction must not create a partial branch."""
         parent_idx = self._check_iteration_parent(iteration)
@@ -1273,6 +1320,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 mutation_accepted=mutation_accepted,
                 state=state,
                 candidate_idx=candidate_idx,
+                after_candidate=after_candidate,
+                after_evaluation=after_evaluation,
             )
         except Exception as exc:
             for idx in set(self._branches) - existing:
@@ -1301,6 +1350,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         mutation_accepted: bool,
         state: GEPAState,
         candidate_idx: int | None,
+        after_candidate: dict[str, str] | None,
+        after_evaluation: EvaluationBatch | None,
     ) -> None:
         parent_idx = self._check_iteration_parent(iteration)
         trace_entry = self._trace_entry(state, iteration)
@@ -1329,6 +1380,18 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             not isinstance(score, Real) or not math.isfinite(float(score)) for score in (*before_scores, *after_scores)
         ):
             raise TaskCuratorContractError("Task curator received invalid mutation-comparison scores")
+        if self.evidence_fn is not None and (after_candidate is None or after_evaluation is None):
+            raise TaskCuratorContractError("evidence_fn requires the actual after candidate and evaluation")
+        if after_candidate is None:
+            after_candidate = state.program_candidates[candidate_idx if candidate_idx is not None else parent_idx]
+        if after_evaluation is None:
+            after_evaluation = EvaluationBatch(
+                outputs=[None] * len(task_ids), scores=list(after_scores), trajectories=list(after_trajectories)
+            )
+        prepared = self._prepare_evidence(after_candidate, after_evaluation)
+        recorded_before = {r["task_id"]: r for r in trace_entry["task_curator_results"]}
+        if any(recorded_before[tid]["score"] != score for tid, score in zip(task_ids, before_scores, strict=True)):
+            raise TaskCuratorContractError("Before scores differ from the recorded parent evaluation")
         if mutation_accepted:
             if candidate_idx is None:
                 raise TaskCuratorContractError("An accepted mutation needs an explicit new candidate ID")
@@ -1340,14 +1403,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         before_sum = sum(float(score) for score in before_scores)
         after_sum = sum(float(score) for score in after_scores)
         results = []
-        for task_id, before_score, before_trajectory, after_score, after_trajectory in zip(
-            task_ids,
-            before_scores,
-            before_trajectories,
-            after_scores,
-            after_trajectories,
-            strict=True,
-        ):
+        for task_id, (evidence, success) in zip(task_ids, prepared, strict=True):
+            before = recorded_before[task_id]
             row = {
                 "event": "mutation_comparison",
                 **self._evidence_metadata(comparison=True),
@@ -1358,13 +1415,15 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 "batch_score_after": after_sum,
                 "before": {
                     "candidate_idx": parent_idx,
-                    "score": float(before_score),
-                    "evaluator_feedback": _json_safe(self.evidence_extractor(before_trajectory)),
+                    **{
+                        key: before[key]
+                        for key in ("score", "outcome", "recovered_crash", "evaluator_feedback", "evidence_summary")
+                        if key in before
+                    },
                 },
                 "after": {
                     "candidate_idx": candidate_idx,
-                    "score": float(after_score),
-                    "evaluator_feedback": _json_safe(self.evidence_extractor(after_trajectory)),
+                    **evidence,
                 },
             }
             before_id = next(
@@ -1376,8 +1435,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 task_id=task_id,
                 iteration=iteration,
                 source="after",
-                score=float(after_score),
-                trajectory=after_trajectory,
+                score=evidence["score"],
+                success=success,
                 state=state,
                 mutation_accepted=mutation_accepted,
             )
@@ -1425,6 +1484,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             outputs=evaluation.outputs,
             trajectories=evaluation.trajectories or [None] * len(task_ids),
             state=state,
+            evaluation=evaluation,
         )
 
     def observe_outcome(
@@ -1469,6 +1529,13 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             mutation_accepted=candidate_idx is not None,
             state=state,
             candidate_idx=candidate_idx,
+            after_candidate=proposal.candidate,
+            after_evaluation=EvaluationBatch(
+                outputs=after.outputs,
+                scores=after.scores,
+                trajectories=after.trajectories,
+                objective_scores=after.objective_scores,
+            ),
         )
 
     def build_reflective_dataset(
@@ -1515,6 +1582,7 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
         if len(set(task_ids)) != len(task_ids):
             raise TaskCuratorContractError("Reflection task IDs must be unique")
 
+        outcomes = {row["task_id"]: row["outcome"] for row in self._context.entry["task_curator_results"]}
         enriched: dict[str, list[dict[str, Any]]] = {}
         injected_task_ids = set()
         skipped_task_ids = []
@@ -1545,9 +1613,8 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 continue
 
             sid = anchors.get(tid)
-            trajectory = single.trajectories[0] if single.trajectories is not None else None
             anchor = None
-            if sid is not None and self.is_failure(single.scores[0], trajectory):
+            if sid is not None and outcomes[tid] == "fail":
                 anchor = {
                     "instruction": (
                         "This is a previously observed successful evaluator state for the same task. Use it as a "
@@ -1679,7 +1746,9 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             raise TaskCuratorContractError("Parent evaluation belongs to a different candidate")
         self._restore_successes(entry, source="before", candidate_idx=parent)
         for row in results:
-            self._append_history(row["task_id"], _history_row_without_output(row))
+            restored = _history_row_without_output(row)
+            restored["outcome"] = self._compact_outcome(row)
+            self._append_history(row["task_id"], restored)
 
     def _restore_cursor(self, entry: dict) -> None:
         # Restore sampling progress on the parent before taking the child's
@@ -1723,7 +1792,10 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                 self._branches[parent] = actual_parent
             self._restore_successes(entry, source="after", candidate_idx=child)
             for row in comparisons:
-                self._append_history(row["task_id"], _history_row_without_output(row))
+                restored = _history_row_without_output(row)
+                for side in ("before", "after"):
+                    restored[side] = {**row[side], "outcome": self._compact_outcome(row[side])}
+                self._append_history(row["task_id"], restored)
         elif child is not None or any(s["source"] == "after" for s in entry.get("task_curator_success_states", [])):
             raise TaskCuratorContractError("Checkpoint has a child without mutation evidence")
 

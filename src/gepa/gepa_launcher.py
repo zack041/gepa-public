@@ -140,6 +140,7 @@ from gepa.core.state import EvaluationCache, FrontierType
 from gepa.image import Image  # noqa: F401 — re-exported for user convenience
 from gepa.logging.experiment_tracker import create_experiment_tracker
 from gepa.logging.logger import Logger, LoggerProtocol, StdOutLogger
+from gepa.oa.budget import BudgetExhausted
 from gepa.proposer.merge import MergeProposer
 from gepa.proposer.reflective_mutation.base import CandidateSelector, LanguageModel, ReflectionComponentSelector
 from gepa.proposer.reflective_mutation.reflection_lm import ReflectionLM
@@ -159,6 +160,7 @@ from gepa.strategies.component_selector import (
 from gepa.strategies.eval_policy import EvaluationPolicy, FullEvaluationPolicy
 from gepa.strategies.proposal_sampling import SamplingStrategy
 from gepa.strategies.proposal_selection import SelectionStrategy
+from gepa.strategies.task_curator import TaskCuratorSampler
 from gepa.utils import FileStopper, StopperProtocol
 from gepa.utils.stdio_capture import ThreadLocalStreamCapture, stream_manager
 
@@ -1012,6 +1014,7 @@ class EvaluatorWrapper:
         capture_stdio: bool = False,
         str_candidate_mode: bool = False,
         raise_on_exception: bool = True,
+        mark_recovered_errors: bool = False,
     ) -> None:
         # Inspect the evaluator's signature once to determine which kwargs it accepts.
         sig = inspect.signature(evaluator_fn)
@@ -1064,6 +1067,8 @@ class EvaluatorWrapper:
                     stderr_capturer.start_capture()
 
                 result = evaluator_fn(eval_candidate, **filtered)
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 result = e  # Sentinel; handled below after cleanup
             finally:
@@ -1079,6 +1084,8 @@ class EvaluatorWrapper:
                 if raise_on_exception:
                     raise result
                 fail_side_info: SideInfo = {"error": str(result)}
+                if mark_recovered_errors:
+                    fail_side_info["infrastructure_error"] = True
                 if log_output:
                     fail_side_info["log"] = log_output
                 if captured_stdout:
@@ -1337,6 +1344,7 @@ def optimize_anything(
             capture_stdio=config.engine.capture_stdio,
             str_candidate_mode=str_candidate_mode,
             raise_on_exception=config.engine.raise_on_exception,
+            mark_recovered_errors=isinstance(config.reflection.batch_sampler, TaskCuratorSampler),
         )
 
     # Resolve cache mode: cache_evaluation controls on/off, cache_evaluation_storage controls where

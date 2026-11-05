@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from gepa.core.adapter import DataInst, EvaluationBatch, GEPAAdapter
+from gepa.oa.budget import BudgetExhausted
 from gepa.proposer.reflective_mutation.base import LanguageModel
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,8 @@ class BatchEvaluatorWrapper:
 
         try:
             raw_results = list(self._fn(call_pairs, **kwargs))
+        except BudgetExhausted:
+            raise
         except Exception as e:
             if self._raise_on_exception:
                 raise
@@ -852,6 +855,8 @@ class OptimizeAnythingAdapter(GEPAAdapter):
                     # Stop when no improvement
                     break
 
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 # Refinement failed, record error and stop
                 all_attempts.append(
