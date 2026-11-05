@@ -89,6 +89,8 @@ For **code optimization** or **single-task** problems, a minibatch of 1-3 is usu
 
 `TaskCuratorSampler` selects tasks using an LLM and retains successful executions for reflection on later failures. Pass it through the existing `batch_sampler` argument; existing adapters do not need new methods.
 
+We recommend using GEPA-Curator with greedy GEPA. The [GEPA-Curator paper](https://arxiv.org/abs/2610.37651v1) evaluates this setting, where each accepted mutation becomes the parent for the next iteration. The example below follows that single lineage.
+
 An optional `evidence_fn(candidate, evaluation)` controls what the curator sees. Like an adapter's `make_reflective_dataset`, it receives the evaluated candidate and an `EvaluationBatch`. Here the batch always contains **one task**, with its original output, score, trajectory, and objective scores. `num_metric_calls` is `None`, since a batch's cost cannot be apportioned to individual tasks.
 
 Return `CuratorEvidence` with three independent views:
@@ -123,10 +125,16 @@ curator = TaskCuratorSampler(
     evidence_fn=curator_evidence,
 )
 
+class LatestAcceptedSelector:
+    def select_candidate_idx(self, state):
+        return len(state.program_candidates) - 1
+
+
 result = gepa.optimize(
     ...,
     adapter=adapter,
     batch_sampler=curator,
+    candidate_selection_strategy=LatestAcceptedSelector(),
 )
 ```
 
