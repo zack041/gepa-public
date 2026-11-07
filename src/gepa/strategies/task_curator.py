@@ -42,8 +42,7 @@ _TASK_STATUSES = frozenset(
 )
 _TASK_STATUS_GUIDANCE = (
     "Return task_status for both run and skip, based on the latest available executions: "
-    "mastered (stable success across recent executions, preferably three consecutive successes), "
-    "normal_failure (ordinary failure, potentially improvable), "
+    "mastered (stable clean success), normal_failure (ordinary failure, potentially improvable), "
     "prompt_sensitive (prompt changes demonstrably affect behavior), impossible (missing essential capability), "
     "no_optimization_signal (relevant changes repeatedly yield no progress or new information), "
     "flaky_evaluation (inconsistent scores for similar behavior or explicit evaluator errors), "
@@ -841,52 +840,53 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
     def _decide(self, task_id: DataId, task: DataInst) -> tuple[DataId, _CuratorDecision]:
         prompt_history = self._prompt_view(task_id)
         return_instruction = (
-            '\n\nReturn only JSON: {"task_status":"...","decision":"run|skip",'
+            '\nReturn only JSON: {"task_status":"...","decision":"run|skip",'
             '"skip_epochs":0,"skip_type":null|"mastered"|"low_signal"}.\n\n'
         )
         prompt = (
             "You are a task curator allocating evaluation budget during text optimization. "
             "Judge this task independently: no other task is visible. Decide whether another rollout is currently useful "
             "for learning a better prompt or obtaining information about the task.\n\n"
-            "Use these definitions:\n\n"
-            "- Mastered: multiple stable, clean successes across separate rollouts. The agent must complete the task "
-            "correctly, not merely benefit from evaluator luck, leaked state, or an accidentally correct final page. "
-            "There must be no recent regression. One success is not sufficient evidence of mastery, it is recommended "
-            "to skip mastered tasks after **three** consecutive success in latest executions.\n"
+            "Use these definitions:\n"
+            "- Mastered: Skip a task as mastered only if the parent prompt completed it cleanly in each of the two "
+            "most recent epochs in which the task ran, with no later observed regression under an accepted mutation. "
+            "A before/after pair counts as one visit within its epoch.\n"
             "- Prompt-sensitive: before/after evaluation pairs show that prompt changes can improve the behavior, "
-            "including partial behavioral correction even when the binary score does not change. Or a previously "
-            "succeeded task now regressed due to a new prompt mutation. Run these tasks.\n"
+            "including partial behavioral correction even when the binary score does not change. Run these tasks.\n"
             "- Operationally impossible: the available tools or UI genuinely lack the required capability, supported by "
             "the action schema, trajectory-derived diagnostics, reference evaluation, or evaluator evidence. "
             "A single unsupported actor claim is insufficient; repeated independent attempts consistently identifying "
             "the same missing essential capability are meaningful evidence.\n"
             "- No current optimization signal: the same failure mode persists across multiple materially relevant prompt "
-            "mutations, with no behavioral progress or new diagnostic information.\n"
+            "mutations, with no behavioral progress or new diagnostic information. Do not infer this merely because several "
+            "mutations failed when they did not address the observed failure.\n"
             "- Flaky evaluation: materially similar behavior and ending states repeatedly receive inconsistent outcomes "
             "without a credible relationship to prompt changes, or there is explicit evidence of an incorrect label, "
-            "stale or contradictory target, or evaluator expectation inconsistent with the user request.\n"
+            "stale or contradictory target, or evaluator expectation inconsistent with the user request. Do not infer "
+            "this from one disagreement, inconsistent actor behavior, or an unusually strict or difficult evaluator.\n"
             "- Uncertain: run rather than skip. A rollout has information value: use it to test uncertain mastery, "
             "suspected flakiness, possible regressions, or ambiguous failure mechanisms.\n\n"
-            "Rollout outcomes: success and fail record task results. An actor that times out with a failure score "
-            "has a failed rollout. infrastructure_error records a recovered execution crash explicitly reported for "
-            "that rollout. unknown means its outcome could not be classified.\n\n"
             "Run unseen or underexplored tasks and tasks with credible prompt-sensitive failures. Skip only when the "
-            "history provides strong evidence that another rollout currently has little value according to above definitions. "
+            "history provides strong evidence that another rollout currently has little optimization or diagnostic value. "
             "A mutation_comparison records paired before/after evaluations even when the proposed mutation was rejected. "
             "Use an improved after result as evidence that the task may be prompt-sensitive, but when mutation_accepted is "
-            "false, do not assume that behavior belongs to the current prompt or that the task is now mastered.\n\n"
+            "false, do not assume that behavior belongs to the current prompt or that the task is now mastered. "
             "For run, return skip_epochs=0 and skip_type=null. For skip, choose a positive integer skip_epochs=N "
             "and skip_type=mastered for stable mastery or low_signal for other reasons. N includes the current "
             "epoch: skipping at epoch E schedules a forced rollout at epoch E+N. No curator call is made during "
             "the wait or at expiry; the task runs automatically at expiry. Choose when another rollout will be "
-            "useful, rather than repeatedly postponing that decision. A skip is not a permanent retirement. "
-            "When a task is first judged mastered, skip it for about 2 epochs so you can check for regression. "
-            "If the task still shows mastery when revisited, a longer skip is appropriate. "
-            "For low_signal skips, use a longer cooldown (around 5 epochs). This gives training more time to improve "
-            "to solve hard tasks, and also reduces the risk that flaky evaluation/impossible tasks will guide optimizer "
-            "towards harmful prompt changes."
-            f"\n\n{_TASK_STATUS_GUIDANCE}"
+            "useful, rather than repeatedly postponing that decision. A skip is not a permanent retirement."
+            f"\n{_TASK_STATUS_GUIDANCE}"
             f"{return_instruction}"
+            "Evaluate the value of another rollout under the current prompt, not only whether previous rollouts "
+            "added new information. A persistent, concrete agent mistake can remain useful optimization "
+            "evidence even when repeated. Repeated failure alone does not establish that targeted fixes have "
+            "been tried or that the current prompt cannot improve. If a task was deferred while optimization "
+            "continued on other tasks, allow a fresh rollout to test whether its behavior changed; do not treat "
+            "an unchanged historical record during the skipped interval as new evidence against retrying. "
+            "This "
+            "does not override stable clean mastery or well-supported missing capability, evaluator defects, or "
+            "infrastructure failure.\n\n"
             f"Task ID:\n{json.dumps(_json_safe(task_id), ensure_ascii=False)}\n\n"
             f"Task:\n{json.dumps(_json_safe(self.task_view(task)), ensure_ascii=False, indent=2)}\n\n"
             f"{self._history_section(task_id, prompt_history)}"
@@ -911,16 +911,18 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                         else {"successful_state": success_evidence}
                     )
                 prompt += (
-                    "\n\nThe latest execution unit contains successful rollouts. Choose a reference success for "
-                    "future reflection from the retained success and the eligible successful rollouts below. "
-                    "Select a new successful execution only if it demonstrates a genuine, reproducible task completion "
-                    "that actually completes the task instead of exploiting judge leniency. Among the actually "
-                    "successful executions, prioritize clear and efficient executions. "
-                    "If a retained success exists, replace it only if another success provides a better reference. "
-                    'Include "selected_success": "retained", "before", or "after" in your JSON response. '
-                    '"retained" leaves the pool unchanged, including when it is empty. '
-                    '"before" or "after" stores that successful trajectory. Only choose a side listed below, '
-                    "failed sides are not eligible. A success remains eligible even if its mutation was rejected."
+                    "\n\nChoose a success to show the reflector as an example of how to complete this task. A passing score"
+                    " makes a rollout eligible for consideration. If an execution only explains why the requested work"
+                    " could not be completed, discard it as a reference even if the judge calls that response correct. If"
+                    ' every new candidate falls into this category, return "selected_success": "retained", including when'
+                    " the pool is empty. When the task asks a question, checking the relevant evidence and giving a"
+                    " supported answer can itself complete the task. Accept any execution that genuinely accomplishes the"
+                    " task, including by a different route. Among qualifying executions, prefer a clear, efficient,"
+                    " reproducible example. Replace an existing reference only with a better one. Include"
+                    ' "selected_success": "retained", "before", or "after" in your JSON response. "retained" leaves the'
+                    ' pool unchanged, including when it is empty. "before" or "after" stores that successful trajectory.'
+                    " Only choose a side listed below, failed sides are not eligible. A success remains eligible even if"
+                    " its mutation was rejected."
                     "\n\nEligible successes (the exact success evidence, or a reference when identical to History):\n"
                     + json.dumps(eligible, ensure_ascii=False, indent=2)
                 )
