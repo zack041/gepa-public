@@ -864,9 +864,6 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
             "without a credible relationship to prompt changes, or there is explicit evidence of an incorrect label, "
             "stale or contradictory target, or evaluator expectation inconsistent with the user request. Do not infer "
             "this from one disagreement, inconsistent actor behavior, or an unusually strict or difficult evaluator.\n"
-            "- Rollout outcomes: success and fail record task results. An actor that times out with a failure score "
-            "has a failed rollout. infrastructure_error records a recovered execution crash explicitly reported for "
-            "that rollout. unknown means its outcome could not be classified.\n"
             "- Uncertain: run rather than skip. A rollout has information value: use it to test uncertain mastery, "
             "suspected flakiness, possible regressions, or ambiguous failure mechanisms.\n\n"
             "Run unseen or underexplored tasks and tasks with credible prompt-sensitive failures. Skip only when the "
@@ -914,14 +911,18 @@ class TaskCuratorSampler(Generic[DataId, DataInst]):
                         else {"successful_state": success_evidence}
                     )
                 prompt += (
-                    "\n\nThe latest execution unit contains successful rollouts. Choose a reference success for "
-                    "future reflection from the retained success and the eligible successful rollouts below. "
-                    "Consider genuine task completion, reproducibility, and clear, efficient execution. "
-                    "If a retained success exists, replace it only if another success provides a better reference. "
-                    'Include "selected_success": "retained", "before", or "after" in your JSON response. '
-                    '"retained" leaves the pool unchanged, including when it is empty. '
-                    '"before" or "after" stores that successful trajectory. Only choose a side listed below; '
-                    "failed sides are not eligible. A success remains eligible even if its mutation was rejected."
+                    "\n\nChoose a success to show the reflector as an example of how to complete this task. A passing score"
+                    " makes a rollout eligible for consideration. If an execution only explains why the requested work"
+                    " could not be completed, discard it as a reference even if the judge calls that response correct. If"
+                    ' every new candidate falls into this category, return "selected_success": "retained", including when'
+                    " the pool is empty. When the task asks a question, checking the relevant evidence and giving a"
+                    " supported answer can itself complete the task. Accept any execution that genuinely accomplishes the"
+                    " task, including by a different route. Among qualifying executions, prefer a clear, efficient,"
+                    " reproducible example. Replace an existing reference only with a better one. Include"
+                    ' "selected_success": "retained", "before", or "after" in your JSON response. "retained" leaves the'
+                    ' pool unchanged, including when it is empty. "before" or "after" stores that successful trajectory.'
+                    " Only choose a side listed below, failed sides are not eligible. A success remains eligible even if"
+                    " its mutation was rejected."
                     "\n\nEligible successes (the exact success evidence, or a reference when identical to History):\n"
                     + json.dumps(eligible, ensure_ascii=False, indent=2)
                 )
